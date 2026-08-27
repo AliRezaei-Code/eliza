@@ -352,7 +352,7 @@ function isMicPermissionDenialError(err: unknown): boolean {
   );
 }
 
-function describeCaptureFailure(err: unknown): string {
+export function describeCaptureFailure(err: unknown): string {
   const name =
     typeof err === "object" &&
     err !== null &&
@@ -364,6 +364,12 @@ function describeCaptureFailure(err: unknown): string {
   const haystack = `${name} ${message}`.toLowerCase();
   if (isMicPermissionDenialError(err)) {
     return "Microphone access was denied. Enable microphone permission in your browser or system settings to use voice.";
+  }
+  // A capture that opened successfully but contained no usable samples proves
+  // the microphone path exists. Classify that as an empty utterance before the
+  // broader "no microphone" device matcher sees the recorder's error text.
+  if (haystack.includes("no microphone audio was captured")) {
+    return "Didn't catch that — no voice audio was captured. Try again.";
   }
   if (
     haystack.includes("notfound") ||
@@ -380,7 +386,7 @@ function describeCaptureFailure(err: unknown): string {
     haystack.includes("cloudstterror") ||
     haystack.includes("cloud asr") ||
     haystack.includes("transcri") ||
-    haystack.includes("no microphone audio was captured")
+    haystack.includes("empty transcript")
   ) {
     return "Didn't catch that — voice transcription failed. Try again.";
   }
@@ -580,26 +586,36 @@ export function useShellController(): ShellController {
   );
 
   // The persistent shell is the mounted /chat surface, so it owns the one
-  // realtime session. A healthy conversation-bound probe selects realtime;
-  // when the probe is absent or mismatched, the same Talk control deliberately
-  // remains usable through the batch ASR/TTS path.
-  const realtimeVoiceFlagEnabled = isRealtimeVoiceFlagEnabled();
+  // realtime session. The build flag advertises the capability, but only a
+  // resolved Dedicated identity plus a healthy conversation-bound probe may
+  // select realtime. Otherwise the same Talk control deliberately remains
+  // usable through the batch ASR/TTS path.
+  const realtimeVoiceBuildEnabled = isRealtimeVoiceFlagEnabled();
   const { agentId: realtimeVoiceAgentId, getConsentNonce } =
     useRealtimeVoiceMint({ conversationId: activeConversationId });
+  // Keep the capability eligible while the first conversation is being
+  // created so a Talk gesture can queue against the UUID published by startup.
+  // The session hook still requires both ids before it reports `available`.
+  const realtimeVoiceCapabilityEnabled =
+    realtimeVoiceBuildEnabled && Boolean(realtimeVoiceAgentId);
   const realtimeVoice = useRealtimeVoiceSession({
     agentId: realtimeVoiceAgentId,
     conversationId: activeConversationId,
     // Treat probe/identity loss as an operational flag-off edge. The session
     // hook's flag effect cancels any pending automatic identity restart before
     // a fast probe recovery can re-open the microphone without a new gesture.
-    flagEnabled:
-      realtimeVoiceFlagEnabled &&
-      Boolean(realtimeVoiceAgentId && activeConversationId?.trim()),
+    flagEnabled: realtimeVoiceCapabilityEnabled,
     getConsentNonce,
     clientOptions: { onServerEvent: handleRealtimeVoiceServerEvent },
   });
   const realtimeVoiceEnabled =
-    realtimeVoiceFlagEnabled && realtimeVoice.available;
+    realtimeVoiceCapabilityEnabled && realtimeVoice.available;
+  // A resolved Dedicated identity may queue Talk while startup is still
+  // publishing the first conversation. Once a conversation exists, the
+  // conversation-bound availability probe is authoritative.
+  const realtimeVoiceCanStart =
+    realtimeVoiceEnabled ||
+    (realtimeVoiceCapabilityEnabled && !activeConversationId?.trim());
   const [realtimeVoiceBatchFallback, setRealtimeVoiceBatchFallback] =
     React.useState(!realtimeVoiceEnabled);
   const realtimeVoiceSelected =
@@ -608,7 +624,7 @@ export function useShellController(): ShellController {
   // client finishes teardown. Keep batch media out until that prior owner has
   // actually released the microphone/audio path.
   const realtimeVoiceOwnsMedia =
-    realtimeVoiceFlagEnabled &&
+    realtimeVoiceBuildEnabled &&
     (realtimeVoiceSelected ||
       realtimeVoice.active ||
       realtimeVoice.connecting ||
@@ -1693,7 +1709,7 @@ export function useShellController(): ShellController {
       recoverGatedCapture();
       return;
     }
-    if (realtimeVoiceEnabled) {
+    if (realtimeVoiceCanStart) {
       if (recording || handsFreeRef.current || realtimeVoiceWantedRef.current) {
         stopRealtimeVoiceRef.current();
       } else {
@@ -1705,7 +1721,7 @@ export function useShellController(): ShellController {
     else startCapture();
   }, [
     authGate.gated,
-    realtimeVoiceEnabled,
+    realtimeVoiceCanStart,
     recording,
     recoverGatedCapture,
     startCapture,
@@ -2008,7 +2024,7 @@ export function useShellController(): ShellController {
 
   const startRealtimeVoice = React.useCallback(async () => {
     if (authGateRef.current.gated) return;
-    if (!realtimeVoiceEnabled) return;
+    if (!realtimeVoiceCanStart) return;
     if (captureRef.current || recording) return;
     if (
       realtimeVoiceWantedRef.current ||
@@ -2071,7 +2087,7 @@ export function useShellController(): ShellController {
     setActionNotice(message, "error", 6000);
   }, [
     ensureActiveConversationForVoice,
-    realtimeVoiceEnabled,
+    realtimeVoiceCanStart,
     recording,
     setActionNotice,
     stopCapture,
@@ -2198,7 +2214,7 @@ export function useShellController(): ShellController {
       recoverGatedCapture();
       return;
     }
-    if (realtimeVoiceEnabled) {
+    if (realtimeVoiceCanStart) {
       if (
         handsFreeRef.current ||
         realtimeVoiceWantedRef.current ||
@@ -2264,7 +2280,7 @@ export function useShellController(): ShellController {
     stopCapture,
     voiceOutput,
     gateEngageOnMicPermission,
-    realtimeVoiceEnabled,
+    realtimeVoiceCanStart,
     startRealtimeVoice,
     stopRealtimeVoice,
   ]);

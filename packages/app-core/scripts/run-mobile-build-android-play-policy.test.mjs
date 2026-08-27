@@ -54,6 +54,9 @@ const AAPT_MANIFEST = `
       E: intent (line=5)
         E: action (line=6)
           A: android:name(0x01010003)="android.speech.RecognitionService" (Raw: "android.speech.RecognitionService")
+      E: intent (line=7)
+        E: action (line=8)
+          A: android:name(0x01010003)="android.intent.action.TTS_SERVICE" (Raw: "android.intent.action.TTS_SERVICE")
     E: uses-permission (line=7)
       A: android:name(0x01010003)="android.permission.INTERNET" (Raw: "android.permission.INTERNET")
     E: application (line=8)
@@ -267,6 +270,7 @@ describe("Android Play manifest policy", () => {
     expect(androidPlayManifestEvidenceFromAapt(AAPT_MANIFEST)).toEqual({
       actions: [
         "android.intent.action.MAIN",
+        "android.intent.action.TTS_SERVICE",
         "android.speech.RecognitionService",
       ],
       application: {
@@ -280,7 +284,10 @@ describe("Android Play manifest policy", () => {
       ],
       metadataNames: ["android.support.FILE_PROVIDER_PATHS"],
       permissions: ["android.permission.INTERNET"],
-      queryActions: ["android.speech.RecognitionService"],
+      queryActions: [
+        "android.intent.action.TTS_SERVICE",
+        "android.speech.RecognitionService",
+      ],
       queryPackages: [],
       targetSdkVersion: "36",
     });
@@ -339,10 +346,10 @@ describe("Android Play manifest policy", () => {
       expect(ANDROID_CLOUD_STRIPPED_PERMISSIONS).toContain(permission);
     }
     expect(ANDROID_PLAY_ALLOWED_NATIVE_LIBRARIES).toEqual([
-      "lib/arm64-v8a/libdatastore_shared_counter.so",
-      "lib/armeabi-v7a/libdatastore_shared_counter.so",
-      "lib/x86/libdatastore_shared_counter.so",
-      "lib/x86_64/libdatastore_shared_counter.so",
+      "base/lib/arm64-v8a/libdatastore_shared_counter.so",
+      "base/lib/armeabi-v7a/libdatastore_shared_counter.so",
+      "base/lib/x86/libdatastore_shared_counter.so",
+      "base/lib/x86_64/libdatastore_shared_counter.so",
     ]);
     expect(ANDROID_PLAY_ALLOWED_PERMISSIONS).toContain(
       "android.permission.MODIFY_AUDIO_SETTINGS",
