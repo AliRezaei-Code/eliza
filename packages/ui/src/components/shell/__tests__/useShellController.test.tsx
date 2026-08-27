@@ -2323,44 +2323,49 @@ describe("useShellController — mounted Cartesia Talk ownership", () => {
       expect(realtimeVoiceMock.options?.flagEnabled).toBe(true);
       expect(voiceOutputMock.realtimeVoiceEnabledSeen).toBe(false);
 
-      await act(async () => {
-        await captureHandles[0]?.stop();
-        await Promise.resolve();
-      });
-
-      expect(realtimeVoiceMock.start).toHaveBeenCalledTimes(1);
-      expect(result.current.handsFree).toBe(true);
-      expect(result.current.realtimeVoice?.enabled).toBe(false);
-      expect(voiceOutputMock.realtimeVoiceEnabledSeen).toBe(false);
-
-      // A batch reply that starts after text streaming finishes still owns TTS;
-      // the positive probe cannot silence it mid-turn.
-      act(() => {
-        appMock.value.chatSending = true;
-        rerender();
-      });
-      expect(voiceOutputMock.realtimeVoiceEnabledSeen).toBe(false);
-      act(() => {
-        appMock.value.chatSending = false;
-        voiceOutputMock.speaking = true;
-        rerender();
-      });
-      expect(voiceOutputMock.realtimeVoiceEnabledSeen).toBe(false);
-      act(() => {
-        voiceOutputMock.speaking = false;
-        rerender();
-      });
-      expect(voiceOutputMock.realtimeVoiceEnabledSeen).toBe(false);
-
-      // Normal toggle semantics: one tap ends the latched batch Talk session;
-      // the next starts realtime against the newly active conversation.
+      // Ending batch Talk is not enough to release the latch while that turn's
+      // text is still streaming. Drive the composer's live source (not the
+      // stale AppContext mirror), then stop Talk and its capture.
+      composerMock.value.chatSending = true;
       await act(async () => {
         result.current.toggleHandsFree();
         await Promise.resolve();
       });
       expect(result.current.handsFree).toBe(false);
+      expect(captureHandles[0]?.stop).toHaveBeenCalledTimes(1);
+      expect(result.current.responding).toBe(true);
+      expect(realtimeVoiceMock.start).toHaveBeenCalledTimes(1);
+      expect(result.current.realtimeVoice?.enabled).toBe(false);
+      expect(voiceOutputMock.realtimeVoiceEnabledSeen).toBe(false);
+
+      // The same batch turn moves from streaming to TTS. With Talk already off,
+      // speaking is now the only remaining owner and must keep realtime latched.
+      await act(async () => {
+        composerMock.value.chatSending = false;
+        voiceOutputMock.speaking = true;
+        rerender();
+        await Promise.resolve();
+      });
+      expect(result.current.handsFree).toBe(false);
+      expect(result.current.responding).toBe(true);
+      expect(realtimeVoiceMock.start).toHaveBeenCalledTimes(1);
+      expect(result.current.realtimeVoice?.enabled).toBe(false);
+      expect(voiceOutputMock.realtimeVoiceEnabledSeen).toBe(false);
+
+      // Once TTS settles, every batch owner is idle and the recovered probe may
+      // make realtime selectable again. It still must not auto-start the mic.
+      await act(async () => {
+        voiceOutputMock.speaking = false;
+        rerender();
+        await Promise.resolve();
+      });
+      expect(result.current.responding).toBe(false);
+      expect(realtimeVoiceMock.start).toHaveBeenCalledTimes(1);
       expect(result.current.realtimeVoice?.enabled).toBe(true);
       expect(voiceOutputMock.realtimeVoiceEnabledSeen).toBe(true);
+
+      // The next explicit Talk gesture starts realtime against the newly active
+      // conversation; probe recovery alone never steals the microphone.
       await act(async () => {
         result.current.toggleHandsFree();
         await Promise.resolve();
