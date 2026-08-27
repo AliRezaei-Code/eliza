@@ -9,6 +9,12 @@ import { saveBrowserVideoArtifact } from "./helpers/video-artifacts";
 
 test.use({ video: { mode: "on", size: { width: 1440, height: 900 } } });
 
+const requestedEvidenceHead = process.env.ELIZA_PR_EVIDENCE_HEAD?.trim();
+if (requestedEvidenceHead && !/^[a-f0-9]{40}$/i.test(requestedEvidenceHead)) {
+  throw new Error("ELIZA_PR_EVIDENCE_HEAD must be a full commit SHA");
+}
+const EVIDENCE_REVISION = requestedEvidenceHead?.slice(0, 12) ?? "local";
+
 const VIEWPORTS = [
   { name: "desktop", width: 1440, height: 900 },
   { name: "mobile", width: 390, height: 844 },
@@ -33,8 +39,14 @@ async function installProviderFixture(page: Page): Promise<void> {
   // proves capability rendering, not an account authorization, and must not
   // open a real wallet or paint a synthetic connection failure into evidence.
   await page.addInitScript(() => {
+    const methods: string[] = [];
+    Object.defineProperty(window, "__elizaWalletCapabilityMethods", {
+      configurable: true,
+      value: methods,
+    });
     const ethereum = {
       request: ({ method }: { method: string }) => {
+        methods.push(method);
         if (method === "eth_accounts") {
           return new Promise<readonly string[]>(() => {});
         }
@@ -109,6 +121,7 @@ for (const viewport of VIEWPORTS) {
     const nonLoopbackRequests: string[] = [];
     const forbiddenAuthRequests: string[] = [];
     const consoleErrors: string[] = [];
+    const httpErrors: string[] = [];
     let providerDiscoveryResponses = 0;
     let walletChunkResponses = 0;
     page.on("console", (message) => {
@@ -140,6 +153,11 @@ for (const viewport of VIEWPORTS) {
       frontendEvents.push(
         `response:${request.method()}:${response.status()}:${safePath(response.url())}`,
       );
+      if (response.status() >= 400) {
+        httpErrors.push(
+          `${request.method()}:${response.status()}:${safePath(response.url())}`,
+        );
+      }
       if (pathname.endsWith("/steward/auth/providers")) {
         providerDiscoveryResponses += 1;
       }
@@ -153,6 +171,7 @@ for (const viewport of VIEWPORTS) {
 
     await page.goto("/login");
     await expect(page.getByRole("heading", { name: "Sign in" })).toBeVisible();
+    expect(walletChunkResponses).toBe(0);
 
     const walletToggle = page.getByRole("button", {
       name: "Continue with a wallet",
@@ -168,10 +187,14 @@ for (const viewport of VIEWPORTS) {
     });
     await expect(evmButton).toBeVisible();
     await expect(solanaButton).toHaveCount(0);
+    expect(
+      walletChunkResponses,
+      "wallet chunks must remain lazy after disclosure alone",
+    ).toBe(0);
 
     await page.screenshot({
       path: testInfo.outputPath(
-        `after-${viewport.name}-siwe-only-disclosed.jpg`,
+        `after-${viewport.name}-siwe-only-disclosed-${EVIDENCE_REVISION}.jpg`,
       ),
       fullPage: true,
       quality: 88,
@@ -187,33 +210,58 @@ for (const viewport of VIEWPORTS) {
     ).toBeDisabled();
     await expect(evmButton).toBeVisible({ timeout: 15_000 });
     await page.waitForTimeout(500);
+    await page.waitForLoadState("networkidle");
 
     await expect(evmButton).toHaveCount(1);
     await expect(solanaButton).toHaveCount(0);
+    await expect(page.getByRole("alert")).toHaveCount(0);
     expect(providerDiscoveryResponses).toBe(1);
     expect(walletChunkResponses).toBeGreaterThanOrEqual(2);
-    expect(pageErrors, "the rendered login must not raise page errors").toEqual(
-      [],
-    );
+    const walletMethods = await page.evaluate(() => {
+      const methods = Reflect.get(window, "__elizaWalletCapabilityMethods");
+      return Array.isArray(methods)
+        ? methods.filter(
+            (method): method is string => typeof method === "string",
+          )
+        : [];
+    });
+    expect(walletMethods).toContain("eth_accounts");
     expect(
-      consoleErrors,
-      "the rendered login must not emit console errors",
+      walletMethods.filter((method) => method !== "eth_accounts"),
+      "the capability proof must not request accounts or signatures",
     ).toEqual([]);
-    expect(
-      requestFailures,
-      "the capability flow must not leave failed requests",
-    ).toEqual([]);
-    expect(
-      nonLoopbackRequests,
-      "the fixture-backed flow must not reach any external origin",
-    ).toEqual([]);
-    expect(
-      forbiddenAuthRequests,
-      "the capability proof must not start OAuth or wallet auth",
-    ).toEqual([]);
+
+    const expectCleanDiagnostics = () => {
+      expect(
+        pageErrors,
+        "the rendered login must not raise page errors",
+      ).toEqual([]);
+      expect(
+        consoleErrors,
+        "the rendered login must not emit console errors",
+      ).toEqual([]);
+      expect(
+        requestFailures,
+        "the capability flow must not leave failed requests",
+      ).toEqual([]);
+      expect(
+        httpErrors,
+        "the capability flow must not receive HTTP errors",
+      ).toEqual([]);
+      expect(
+        nonLoopbackRequests,
+        "the fixture-backed flow must not reach any external origin",
+      ).toEqual([]);
+      expect(
+        forbiddenAuthRequests,
+        "the capability proof must not start OAuth or wallet auth",
+      ).toEqual([]);
+    };
+    expectCleanDiagnostics();
+
     await page.screenshot({
       path: testInfo.outputPath(
-        `after-${viewport.name}-siwe-only-lazy-stack.jpg`,
+        `after-${viewport.name}-siwe-only-lazy-stack-${EVIDENCE_REVISION}.jpg`,
       ),
       fullPage: true,
       quality: 88,
@@ -221,18 +269,26 @@ for (const viewport of VIEWPORTS) {
     });
 
     const frontendLogPath = testInfo.outputPath(
-      `after-${viewport.name}-frontend-network.log`,
+      `after-${viewport.name}-frontend-network-${EVIDENCE_REVISION}.log`,
     );
+
+    const video = page.video();
+    await page.context().close();
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expectCleanDiagnostics();
+
     await writeFile(
       frontendLogPath,
       `${[
         "assertion:page-errors=0",
         "assertion:console-errors=0",
         "assertion:request-failures=0",
+        "assertion:http-errors=0",
         "assertion:non-loopback-egress=0",
         "assertion:forbidden-auth-requests=0",
         `assertion:provider-discovery-responses=${providerDiscoveryResponses}`,
         `assertion:wallet-chunk-responses=${walletChunkResponses}`,
+        `assertion:wallet-methods=${walletMethods.join(",")}`,
         ...frontendEvents,
       ].join("\n")}\n`,
     );
@@ -241,14 +297,15 @@ for (const viewport of VIEWPORTS) {
       contentType: "text/plain",
     });
 
-    const video = page.video();
-    await page.context().close();
     if (video) {
       const artifact = await saveBrowserVideoArtifact({
         video,
         testInfo,
-        basename: `after-${viewport.name}-wallet-capability-walkthrough`,
+        basename: `after-${viewport.name}-wallet-capability-walkthrough-${EVIDENCE_REVISION}`,
       });
+      if (requestedEvidenceHead) {
+        expect(artifact.contentType).toBe("video/mp4");
+      }
       await testInfo.attach(`${viewport.name} wallet capability walkthrough`, {
         path: artifact.path,
         contentType: artifact.contentType,
