@@ -15,7 +15,10 @@ import {
   UI_SMOKE_AUDIT_PROJECTS_ENV,
   writeAuditProjectPropagation,
 } from "./scripts/lib/playwright-audit-projects.mjs";
-import { resolveUiSmokeReuseExistingServer } from "./scripts/lib/playwright-formal-evidence.mjs";
+import {
+  assertFormalEvidenceRepositoryState,
+  resolveUiSmokeReuseExistingServer,
+} from "./scripts/lib/playwright-formal-evidence.mjs";
 import { resolvePlaywrightNodeRuntime } from "./scripts/lib/playwright-node-runtime.mjs";
 import { resolvePlaywrightPortEnv } from "./scripts/lib/playwright-port.mjs";
 import {
@@ -47,6 +50,9 @@ const uiSmokePort = resolvePlaywrightPortEnv(
   "ELIZA_UI_SMOKE_PORT",
   2138,
 );
+// Formal evidence provenance is checked while Playwright loads this config,
+// before its webServer process or fresh renderer build can start.
+assertFormalEvidenceRepositoryState(process.env, repoRoot);
 const reuseExistingServer = resolveUiSmokeReuseExistingServer(process.env);
 // Fail-fast Node runtime resolution: the shared app-core validator throws at
 // config load — before the webServer command spawns — when ELIZA_NODE_PATH is

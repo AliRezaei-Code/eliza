@@ -121,11 +121,133 @@ function isForbiddenLocalServiceRequest(
 }
 
 function isBrowserDataRequest(resourceType: string): boolean {
-  return resourceType === "fetch" || resourceType === "xhr";
+  return ["eventsource", "fetch", "ping", "xhr"].includes(resourceType);
 }
 
 function isRendererManifestRequest(method: string, pathname: string): boolean {
   return method === "GET" && pathname === "/eliza-renderer-build.json";
+}
+
+function canonicalizePathname(pathname: string): string | null {
+  let canonical = pathname;
+  for (let depth = 0; depth < 4; depth += 1) {
+    let decoded: string;
+    try {
+      decoded = decodeURIComponent(canonical);
+    } catch {
+      return null;
+    }
+    if (decoded === canonical) return canonical;
+    canonical = decoded;
+  }
+  return null;
+}
+
+function resolveRequestPath(rawUrl: string): {
+  canonical: boolean;
+  pathname: string;
+} | null {
+  const url = parseUrl(rawUrl);
+  if (!url) return null;
+  const pathname = canonicalizePathname(url.pathname);
+  if (pathname === null) return null;
+  return { canonical: pathname === url.pathname, pathname };
+}
+
+function isExactRendererUrl(
+  rawUrl: string,
+  expectedRendererOrigin: string,
+  expectedPathname: string,
+): boolean {
+  const url = parseUrl(rawUrl);
+  const requestPath = resolveRequestPath(rawUrl);
+  return (
+    url?.origin === expectedRendererOrigin &&
+    requestPath?.canonical === true &&
+    requestPath.pathname === expectedPathname &&
+    url.search === "" &&
+    url.hash === ""
+  );
+}
+
+function isExactProviderDiscoveryRequest(
+  method: string,
+  rawUrl: string,
+  resourceType: string,
+  expectedRendererOrigin: string,
+): boolean {
+  return (
+    method === "GET" &&
+    (resourceType === "fetch" || resourceType === "xhr") &&
+    isExactRendererUrl(
+      rawUrl,
+      expectedRendererOrigin,
+      "/steward/auth/providers",
+    )
+  );
+}
+
+function isExactRendererManifestRequest(
+  method: string,
+  rawUrl: string,
+  resourceType: string,
+  expectedRendererOrigin: string,
+): boolean {
+  return (
+    method === "GET" &&
+    (resourceType === "fetch" || resourceType === "xhr") &&
+    isExactRendererUrl(
+      rawUrl,
+      expectedRendererOrigin,
+      "/eliza-renderer-build.json",
+    )
+  );
+}
+
+function isAllowedStaticRendererRequest(
+  method: string,
+  rawUrl: string,
+  expectedRendererOrigin: string,
+): boolean {
+  if (method !== "GET") return false;
+  const url = parseUrl(rawUrl);
+  const requestPath = resolveRequestPath(rawUrl);
+  if (
+    url?.origin !== expectedRendererOrigin ||
+    requestPath?.canonical !== true ||
+    url.search !== "" ||
+    url.hash !== ""
+  ) {
+    return false;
+  }
+  return (
+    requestPath.pathname.startsWith("/assets/") ||
+    requestPath.pathname.startsWith("/brand/") ||
+    requestPath.pathname === "/site.webmanifest"
+  );
+}
+
+function isAllowedRendererNonDocumentRequest(
+  method: string,
+  rawUrl: string,
+  resourceType: string,
+  expectedRendererOrigin: string,
+): boolean {
+  return (
+    isExactProviderDiscoveryRequest(
+      method,
+      rawUrl,
+      resourceType,
+      expectedRendererOrigin,
+    ) ||
+    isExactRendererManifestRequest(
+      method,
+      rawUrl,
+      resourceType,
+      expectedRendererOrigin,
+    ) ||
+    isAllowedStaticRendererRequest(method, rawUrl, expectedRendererOrigin)
+  );
 }
 
 function isForbiddenLocalDataRequest(
@@ -157,8 +279,33 @@ function isAllowedInitialLoginDocument(
   );
 }
 
+function createInitialLoginDocumentGate(
+  expectedRendererOrigin: string,
+): (
+  method: string,
+  rawUrl: string,
+  resourceType: string,
+  isExpectedMainFrame: boolean,
+) => boolean {
+  let documentConsumed = false;
+  return (method, rawUrl, resourceType, isExpectedMainFrame) => {
+    if (resourceType !== "document" || documentConsumed) return false;
+    documentConsumed = true;
+    return (
+      isExpectedMainFrame &&
+      isAllowedInitialLoginDocument(
+        method,
+        rawUrl,
+        resourceType,
+        expectedRendererOrigin,
+      )
+    );
+  };
+}
+
 async function installProviderFixture(
   context: BrowserContext,
+  page: Page,
   expectedRendererOrigin: string,
 ): Promise<void> {
   // Keep the provider-backed intent pending after the lazy boundary. The test
@@ -187,27 +334,44 @@ async function installProviderFixture(
   // This catch-all is installed before navigation, so unexpected wallet RPC,
   // WalletConnect, OAuth, or provider traffic is aborted before network egress
   // instead of merely being noticed after transmission.
+  const consumeInitialLoginDocument = createInitialLoginDocumentGate(
+    expectedRendererOrigin,
+  );
   await context.route("**/*", async (route) => {
     const request = route.request();
     const requestUrl = request.url();
-    const pathname = parseUrl(requestUrl)?.pathname ?? "";
+    const requestPath = resolveRequestPath(requestUrl);
     if (!isExpectedRendererResource(requestUrl, expectedRendererOrigin)) {
+      await route.abort("blockedbyclient");
+      return;
+    }
+    // Reject encoded, multiply encoded, and malformed renderer paths before
+    // routing. Framework routers may decode those paths and otherwise turn an
+    // apparently harmless resource into a real /api or /steward request.
+    if (!requestPath?.canonical) {
       await route.abort("blockedbyclient");
       return;
     }
     if (
       request.resourceType() === "document" &&
-      !isAllowedInitialLoginDocument(
+      !consumeInitialLoginDocument(
+        request.method(),
+        requestUrl,
+        request.resourceType(),
+        request.frame() === page.mainFrame(),
+      )
+    ) {
+      await route.abort("blockedbyclient");
+      return;
+    }
+    if (
+      isExactProviderDiscoveryRequest(
         request.method(),
         requestUrl,
         request.resourceType(),
         expectedRendererOrigin,
       )
     ) {
-      await route.abort("blockedbyclient");
-      return;
-    }
-    if (isCanonicalProviderDiscovery(request.method(), pathname)) {
       await route.fulfill({
         status: 200,
         contentType: "application/json",
@@ -216,12 +380,12 @@ async function installProviderFixture(
       return;
     }
     if (
-      isForbiddenHttpAuthRequest(request.method(), pathname) ||
-      isForbiddenLocalServiceRequest(request.method(), pathname) ||
-      isForbiddenLocalDataRequest(
+      request.resourceType() !== "document" &&
+      !isAllowedRendererNonDocumentRequest(
         request.method(),
-        pathname,
+        requestUrl,
         request.resourceType(),
+        expectedRendererOrigin,
       )
     ) {
       await route.abort("blockedbyclient");
@@ -415,6 +579,8 @@ test("hosted login egress policy covers every current auth route family", () => 
   expect(isForbiddenLocalDataRequest("GET", "/assets/app.js", "script")).toBe(
     false,
   );
+  expect(isBrowserDataRequest("ping")).toBe(true);
+  expect(isBrowserDataRequest("eventsource")).toBe(true);
 
   const expectedOrigin = "http://127.0.0.1:2138";
   expect(
@@ -449,6 +615,104 @@ test("hosted login egress policy covers every current auth route family", () => 
       expectedOrigin,
     ),
   ).toBe(false);
+
+  for (const [encodedPath, canonicalPath] of [
+    [
+      "/%61pi/v1/eliza/lifeops/github-complete",
+      "/api/v1/eliza/lifeops/github-complete",
+    ],
+    ["/%73teward/session", "/steward/session"],
+    ["/%2561pi/cloud/v1/twitter/connect", "/api/cloud/v1/twitter/connect"],
+  ] as const) {
+    const resolved = resolveRequestPath(`${expectedOrigin}${encodedPath}`);
+    expect(resolved?.pathname).toBe(canonicalPath);
+    expect(resolved?.canonical).toBe(false);
+    expect(
+      isForbiddenLocalServiceRequest("GET", resolved?.pathname ?? ""),
+      `${encodedPath} must classify as its decoded local service path`,
+    ).toBe(true);
+  }
+  expect(resolveRequestPath(`${expectedOrigin}/%zz`)).toBeNull();
+
+  expect(
+    isExactProviderDiscoveryRequest(
+      "GET",
+      `${expectedOrigin}/steward/auth/providers`,
+      "fetch",
+      expectedOrigin,
+    ),
+  ).toBe(true);
+  expect(
+    isExactProviderDiscoveryRequest(
+      "GET",
+      `${expectedOrigin}/steward/auth/providers?state=redacted`,
+      "fetch",
+      expectedOrigin,
+    ),
+    "provider discovery with query state must not enter the fixture allowlist",
+  ).toBe(false);
+  expect(
+    isAllowedStaticRendererRequest(
+      "GET",
+      `${expectedOrigin}/brand/logos/logo_white_nobg.svg`,
+      expectedOrigin,
+    ),
+  ).toBe(true);
+  for (const [method, url, resourceType] of [
+    ["POST", `${expectedOrigin}/assets/index.js`, "script"],
+    ["GET", `${expectedOrigin}/assets/index.js?callback=redacted`, "script"],
+    [
+      "GET",
+      `${expectedOrigin}/brand/favicons/favicon.svg?state=redacted`,
+      "image",
+    ],
+    ["GET", `${expectedOrigin}/telemetry.gif?state=redacted`, "image"],
+    ["GET", `${expectedOrigin}/events`, "eventsource"],
+    ["GET", `${expectedOrigin}/steward/auth/providers`, "script"],
+    ["GET", `${expectedOrigin}/eliza-renderer-build.json`, "image"],
+  ] as const) {
+    expect(
+      isAllowedRendererNonDocumentRequest(
+        method,
+        url,
+        resourceType,
+        expectedOrigin,
+      ),
+      `${method} ${resourceType} ${url} must remain outside the exact non-document allowlist`,
+    ).toBe(false);
+  }
+
+  const consumeInitialLoginDocument =
+    createInitialLoginDocumentGate(expectedOrigin);
+  expect(
+    consumeInitialLoginDocument(
+      "GET",
+      `${expectedOrigin}/login`,
+      "document",
+      true,
+    ),
+  ).toBe(true);
+  expect(
+    consumeInitialLoginDocument(
+      "GET",
+      `${expectedOrigin}/login`,
+      "document",
+      true,
+    ),
+    "an exact same-URL reload must not receive a second document allowance",
+  ).toBe(false);
+
+  const rejectIframeAsInitialDocument =
+    createInitialLoginDocumentGate(expectedOrigin);
+  expect(
+    rejectIframeAsInitialDocument(
+      "GET",
+      `${expectedOrigin}/login`,
+      "document",
+      false,
+    ),
+    "an iframe must not consume an apparently valid initial login document",
+  ).toBe(false);
 });
 
 for (const viewport of VIEWPORTS) {
@@ -469,6 +733,9 @@ for (const viewport of VIEWPORTS) {
     const unexpectedLocalWebSockets: string[] = [];
     const unexpectedLocalServiceRequests: string[] = [];
     const unexpectedLocalDataRequests: string[] = [];
+    const unexpectedLocalResourceRequests: string[] = [];
+    const unexpectedNonCanonicalPathRequests: string[] = [];
+    const documentRequests: string[] = [];
     const unexpectedDocumentRequests: string[] = [];
     const unexpectedMainFrameNavigations: string[] = [];
     const unexpectedPages: string[] = [];
@@ -508,9 +775,13 @@ for (const viewport of VIEWPORTS) {
     context.on("page", attachPageDiagnostics);
     context.on("request", (request) => {
       const path = safeResourceLabel(request.url(), expectedRendererOrigin);
-      const pathname = parseUrl(request.url())?.pathname ?? "";
+      const requestPath = resolveRequestPath(request.url());
+      const pathname = requestPath?.pathname ?? "";
       if (!isExpectedRendererResource(request.url(), expectedRendererOrigin)) {
         unexpectedOriginRequests.push(`${request.method()}:${path}`);
+      }
+      if (!requestPath?.canonical) {
+        unexpectedNonCanonicalPathRequests.push(`${request.method()}:${path}`);
       }
       if (isForbiddenHttpAuthRequest(request.method(), pathname)) {
         forbiddenAuthRequests.push(`${request.method()}:${path}`);
@@ -524,21 +795,48 @@ for (const viewport of VIEWPORTS) {
       if (
         isExpectedRendererResource(request.url(), expectedRendererOrigin) &&
         isBrowserDataRequest(request.resourceType()) &&
-        !isCanonicalProviderDiscovery(request.method(), pathname) &&
-        !isRendererManifestRequest(request.method(), pathname)
-      ) {
-        unexpectedLocalDataRequests.push(`${request.method()}:${path}`);
-      }
-      if (
-        request.resourceType() === "document" &&
-        !isAllowedInitialLoginDocument(
+        !isExactProviderDiscoveryRequest(
+          request.method(),
+          request.url(),
+          request.resourceType(),
+          expectedRendererOrigin,
+        ) &&
+        !isExactRendererManifestRequest(
           request.method(),
           request.url(),
           request.resourceType(),
           expectedRendererOrigin,
         )
       ) {
-        unexpectedDocumentRequests.push(`${request.method()}:${path}`);
+        unexpectedLocalDataRequests.push(`${request.method()}:${path}`);
+      }
+      if (
+        isExpectedRendererResource(request.url(), expectedRendererOrigin) &&
+        request.resourceType() !== "document" &&
+        !isAllowedRendererNonDocumentRequest(
+          request.method(),
+          request.url(),
+          request.resourceType(),
+          expectedRendererOrigin,
+        )
+      ) {
+        unexpectedLocalResourceRequests.push(`${request.method()}:${path}`);
+      }
+      if (request.resourceType() === "document") {
+        const documentLabel = `${request.method()}:${path}`;
+        documentRequests.push(documentLabel);
+        if (
+          documentRequests.length !== 1 ||
+          request.frame() !== page.mainFrame() ||
+          !isAllowedInitialLoginDocument(
+            request.method(),
+            request.url(),
+            request.resourceType(),
+            expectedRendererOrigin,
+          )
+        ) {
+          unexpectedDocumentRequests.push(documentLabel);
+        }
       }
       if (
         pathname.includes("/assets/wallet-buttons-") ||
@@ -564,7 +862,14 @@ for (const viewport of VIEWPORTS) {
           `${request.method()}:${response.status()}:${safeResourceLabel(response.url(), expectedRendererOrigin)}`,
         );
       }
-      if (isCanonicalProviderDiscovery(request.method(), pathname)) {
+      if (
+        isExactProviderDiscoveryRequest(
+          request.method(),
+          response.url(),
+          request.resourceType(),
+          expectedRendererOrigin,
+        )
+      ) {
         providerDiscoveryResponses += 1;
       }
       if (
@@ -590,7 +895,7 @@ for (const viewport of VIEWPORTS) {
       unexpectedLocalWebSockets.push("WS:[local-resource]");
       await webSocket.close({ code: 1008, reason: "blocked by test policy" });
     });
-    await installProviderFixture(context, expectedRendererOrigin);
+    await installProviderFixture(context, page, expectedRendererOrigin);
 
     await page.goto(expectedLoginUrl);
     await expect(page.getByRole("heading", { name: "Sign in" })).toBeVisible();
@@ -708,9 +1013,21 @@ for (const viewport of VIEWPORTS) {
         "the capability proof must not make unallowlisted local data requests",
       ).toEqual([]);
       expect(
+        unexpectedLocalResourceRequests,
+        "the capability proof must not make any exact-origin request outside the document, discovery, manifest, and static-resource allowlist",
+      ).toEqual([]);
+      expect(
         unexpectedLocalServiceRequests,
         "the capability proof must not reach an unallowlisted local service endpoint",
       ).toEqual([]);
+      expect(
+        unexpectedNonCanonicalPathRequests,
+        "the capability proof must not request an encoded, multiply encoded, or malformed renderer path",
+      ).toEqual([]);
+      expect(
+        documentRequests,
+        "the capability proof must request exactly one canonical main-frame login document",
+      ).toEqual(["GET:[login-route]"]);
       expect(
         unexpectedDocumentRequests,
         "the capability proof must not request a second or non-canonical document",
@@ -762,6 +1079,9 @@ for (const viewport of VIEWPORTS) {
         "assertion:unexpected-local-websockets=0",
         "assertion:unexpected-local-service-requests=0",
         "assertion:unexpected-local-data-requests=0",
+        "assertion:unexpected-local-resource-requests=0",
+        "assertion:unexpected-noncanonical-path-requests=0",
+        "assertion:document-requests=1",
         "assertion:unexpected-document-requests=0",
         "assertion:unexpected-main-frame-navigations=0",
         "assertion:unexpected-pages=0",
