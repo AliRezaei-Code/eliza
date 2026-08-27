@@ -7,6 +7,7 @@
 import { Capacitor } from "@capacitor/core";
 import type {
   EncryptedRemoteControlEnvelope,
+  isRemoteControllerPublicIdentity,
   RemoteCommandAction,
   RemoteControllerPublicIdentity,
   RemoteJsonValue,
@@ -76,14 +77,27 @@ export async function getOrCreateRemoteControllerIdentity(input: {
       displayName: input.displayName ?? "My iPhone",
       platform: Capacitor.getPlatform(),
     });
+    const publicIdentity = identity && {
+      version: identity.version,
+      role: identity.role,
+      ownerId: identity.ownerId,
+      deviceId: identity.deviceId,
+      keyId: identity.keyId,
+      displayName: identity.displayName,
+      platform: identity.platform,
+      signingPublicKeyJwk: identity.signingPublicKeyJwk,
+      encryptionPublicKeyJwk: identity.encryptionPublicKeyJwk,
+      createdAt: identity.createdAt,
+    };
     if (
-      !identity?.deviceId ||
-      !identity.keyId ||
-      !identity.encryptionPublicKeyJwk
+      !publicIdentity ||
+      publicIdentity.ownerId !== input.ownerId ||
+      publicIdentity.platform !== "ios" ||
+      !isRemoteControllerPublicIdentity(publicIdentity)
     ) {
       throw new Error("Secure mobile pairing identity is unavailable.");
     }
-    return identity;
+    return publicIdentity;
   }
   const platform = desktopPlatform();
   const identity =
