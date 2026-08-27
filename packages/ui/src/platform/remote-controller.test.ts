@@ -39,8 +39,18 @@ describe("Capacitor remote controller bridge", () => {
       keyId: "key-1",
       displayName: "My iPhone",
       platform: "ios",
-      signingPublicKeyJwk: { kty: "EC", x: "x", y: "y", crv: "P-256" },
-      encryptionPublicKeyJwk: { kty: "EC", x: "x", y: "y", crv: "P-256" },
+      signingPublicKeyJwk: {
+        kty: "EC",
+        x: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        y: "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+        crv: "P-256",
+      },
+      encryptionPublicKeyJwk: {
+        kty: "EC",
+        x: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        y: "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+        crv: "P-256",
+      },
       createdAt: Date.now(),
     });
     const identity = await getOrCreateRemoteControllerIdentity({
@@ -66,12 +76,17 @@ describe("Capacitor remote controller bridge", () => {
       platform: "ios",
       signingPublicKeyJwk: {
         kty: "EC",
-        x: "x",
-        y: "y",
+        x: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        y: "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
         crv: "P-256",
         d: "secret",
       },
-      encryptionPublicKeyJwk: { kty: "EC", x: "x", y: "y", crv: "P-256" },
+      encryptionPublicKeyJwk: {
+        kty: "EC",
+        x: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        y: "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+        crv: "P-256",
+      },
       createdAt: Date.now(),
       privateKeyJwk: { d: "secret" },
     });
@@ -89,8 +104,18 @@ describe("Capacitor remote controller bridge", () => {
       keyId: "key-1",
       displayName: "My iPhone",
       platform: "android",
-      signingPublicKeyJwk: { kty: "EC", x: "x", y: "y", crv: "P-256" },
-      encryptionPublicKeyJwk: { kty: "EC", x: "x", y: "y", crv: "P-256" },
+      signingPublicKeyJwk: {
+        kty: "EC",
+        x: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        y: "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+        crv: "P-256",
+      },
+      encryptionPublicKeyJwk: {
+        kty: "EC",
+        x: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        y: "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+        crv: "P-256",
+      },
       createdAt: Date.now(),
     });
     await expect(
