@@ -207,6 +207,7 @@ function isExactRendererManifestRequest(
 function isAllowedStaticRendererRequest(
   method: string,
   rawUrl: string,
+  resourceType: string,
   expectedRendererOrigin: string,
 ): boolean {
   if (method !== "GET") return false;
@@ -220,11 +221,24 @@ function isAllowedStaticRendererRequest(
   ) {
     return false;
   }
-  return (
-    requestPath.pathname.startsWith("/assets/") ||
-    requestPath.pathname.startsWith("/brand/") ||
-    requestPath.pathname === "/site.webmanifest"
-  );
+  const pathname = requestPath.pathname;
+  if (pathname === "/site.webmanifest") return resourceType === "manifest";
+  if (pathname.startsWith("/brand/")) {
+    return (
+      resourceType === "image" &&
+      /\.(?:avif|gif|ico|jpe?g|png|svg|webp)$/i.test(pathname)
+    );
+  }
+  if (!pathname.startsWith("/assets/")) return false;
+
+  const allowedExtensionByResourceType: Readonly<Record<string, RegExp>> = {
+    font: /\.(?:otf|ttf|woff2?)$/i,
+    image: /\.(?:avif|gif|ico|jpe?g|png|svg|webp)$/i,
+    media: /\.(?:m4a|mp3|mp4|ogg|wav|webm)$/i,
+    script: /\.(?:cjs|js|mjs)$/i,
+    stylesheet: /\.css$/i,
+  };
+  return allowedExtensionByResourceType[resourceType]?.test(pathname) === true;
 }
 
 function isAllowedRendererNonDocumentRequest(
@@ -246,7 +260,12 @@ function isAllowedRendererNonDocumentRequest(
       resourceType,
       expectedRendererOrigin,
     ) ||
-    isAllowedStaticRendererRequest(method, rawUrl, expectedRendererOrigin)
+    isAllowedStaticRendererRequest(
+      method,
+      rawUrl,
+      resourceType,
+      expectedRendererOrigin,
+    )
   );
 }
 
@@ -655,6 +674,7 @@ test("hosted login egress policy covers every current auth route family", () => 
     isAllowedStaticRendererRequest(
       "GET",
       `${expectedOrigin}/brand/logos/logo_white_nobg.svg`,
+      "image",
       expectedOrigin,
     ),
   ).toBe(true);
@@ -670,6 +690,9 @@ test("hosted login egress policy covers every current auth route family", () => 
     ["GET", `${expectedOrigin}/events`, "eventsource"],
     ["GET", `${expectedOrigin}/steward/auth/providers`, "script"],
     ["GET", `${expectedOrigin}/eliza-renderer-build.json`, "image"],
+    ["GET", `${expectedOrigin}/assets/existing-bundle.js`, "image"],
+    ["GET", `${expectedOrigin}/assets/existing-bundle.js`, "fetch"],
+    ["GET", `${expectedOrigin}/assets/existing-bundle.js`, "eventsource"],
   ] as const) {
     expect(
       isAllowedRendererNonDocumentRequest(
@@ -680,6 +703,24 @@ test("hosted login egress policy covers every current auth route family", () => 
       ),
       `${method} ${resourceType} ${url} must remain outside the exact non-document allowlist`,
     ).toBe(false);
+  }
+  for (const [url, resourceType] of [
+    [`${expectedOrigin}/assets/index.js`, "script"],
+    [`${expectedOrigin}/assets/styles.css`, "stylesheet"],
+    [`${expectedOrigin}/assets/font.woff2`, "font"],
+    [`${expectedOrigin}/assets/logo.svg`, "image"],
+    [`${expectedOrigin}/assets/walkthrough.mp4`, "media"],
+    [`${expectedOrigin}/site.webmanifest`, "manifest"],
+  ] as const) {
+    expect(
+      isAllowedRendererNonDocumentRequest(
+        "GET",
+        url,
+        resourceType,
+        expectedOrigin,
+      ),
+      `${resourceType} ${url} must remain in the typed static allowlist`,
+    ).toBe(true);
   }
 
   const consumeInitialLoginDocument =
