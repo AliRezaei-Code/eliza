@@ -6,7 +6,13 @@
 import { execFileSync } from "node:child_process";
 import { writeFile } from "node:fs/promises";
 import path from "node:path";
-import { type BrowserContext, expect, type Page, test } from "@playwright/test";
+import {
+  type BrowserContext,
+  expect,
+  type Page,
+  type TestInfo,
+  test,
+} from "@playwright/test";
 import { saveBrowserVideoArtifact } from "./helpers/video-artifacts";
 
 test.use({
@@ -85,7 +91,7 @@ function isAuthSurface(pathname: string): boolean {
     .split("/")
     .filter(Boolean)
     .some((segment) =>
-      /^(?:(?:[a-z0-9]+[-_])*(?:auth|oauth2?|oidc|callback)(?:[-_][a-z0-9]+)*|authorize|authorization|authentication)$/i.test(
+      /^(?:(?:[a-z0-9]+[-_])*(?:auth|oauth2?|oidc|callback|pair|pairing)(?:[-_][a-z0-9]+)*|authorize|authorization|authentication)$/i.test(
         segment,
       ),
     );
@@ -134,7 +140,27 @@ function isForbiddenLocalDataRequest(
   );
 }
 
-async function installProviderFixture(context: BrowserContext): Promise<void> {
+function isAllowedInitialLoginDocument(
+  method: string,
+  rawUrl: string,
+  resourceType: string,
+  expectedRendererOrigin: string,
+): boolean {
+  const url = parseUrl(rawUrl);
+  return (
+    method === "GET" &&
+    resourceType === "document" &&
+    url?.origin === expectedRendererOrigin &&
+    url.pathname === "/login" &&
+    url.search === "" &&
+    url.hash === ""
+  );
+}
+
+async function installProviderFixture(
+  context: BrowserContext,
+  expectedRendererOrigin: string,
+): Promise<void> {
   // Keep the provider-backed intent pending after the lazy boundary. The test
   // proves capability rendering, not an account authorization, and must not
   // open a real wallet or paint a synthetic connection failure into evidence.
@@ -165,7 +191,19 @@ async function installProviderFixture(context: BrowserContext): Promise<void> {
     const request = route.request();
     const requestUrl = request.url();
     const pathname = parseUrl(requestUrl)?.pathname ?? "";
-    if (!isLoopbackOrLocalResource(requestUrl)) {
+    if (!isExpectedRendererResource(requestUrl, expectedRendererOrigin)) {
+      await route.abort("blockedbyclient");
+      return;
+    }
+    if (
+      request.resourceType() === "document" &&
+      !isAllowedInitialLoginDocument(
+        request.method(),
+        requestUrl,
+        request.resourceType(),
+        expectedRendererOrigin,
+      )
+    ) {
       await route.abort("blockedbyclient");
       return;
     }
@@ -201,13 +239,18 @@ function parseUrl(rawUrl: string): URL | null {
   }
 }
 
-function safeResourceLabel(rawUrl: string): string {
+function safeResourceLabel(
+  rawUrl: string,
+  expectedRendererOrigin: string,
+): string {
   const url = parseUrl(rawUrl);
   if (!url) return "[unparseable-url]";
   if (url.protocol === "data:" || url.protocol === "blob:") {
     return `[${url.protocol.slice(0, -1)}-url]`;
   }
-  if (!isLoopbackOrLocalResource(rawUrl)) return "[external-origin]";
+  if (!isExpectedRendererResource(rawUrl, expectedRendererOrigin)) {
+    return "[unexpected-origin]";
+  }
   if (url.pathname === "/login") return "[login-route]";
   if (url.pathname === "/eliza-renderer-build.json") {
     return "[renderer-manifest]";
@@ -222,24 +265,37 @@ function safeResourceLabel(rawUrl: string): string {
     return "[wallet-chunk]";
   }
   if (url.pathname.startsWith("/assets/")) return "[local-asset]";
-  // Unknown loopback paths can still contain callback codes, session ids, or
+  // Unknown renderer-origin paths can still contain callback codes, session ids, or
   // other credentials. Keep them useful only as a resource class.
   return "[local-resource]";
 }
 
-function isLoopbackOrLocalResource(rawUrl: string): boolean {
+function isExpectedRendererResource(
+  rawUrl: string,
+  expectedRendererOrigin: string,
+): boolean {
   const url = parseUrl(rawUrl);
   if (!url) return false;
   if (url.protocol === "data:" || url.protocol === "blob:") return true;
-  return (
-    (url.protocol === "http:" ||
-      url.protocol === "https:" ||
-      url.protocol === "ws:" ||
-      url.protocol === "wss:") &&
-    (url.hostname === "127.0.0.1" ||
-      url.hostname === "localhost" ||
-      url.hostname === "[::1]")
-  );
+
+  const expected = new URL(expectedRendererOrigin);
+  if (url.protocol === "http:" || url.protocol === "https:") {
+    return url.origin === expected.origin;
+  }
+
+  const expectedSocketProtocol =
+    expected.protocol === "https:" ? "wss:" : "ws:";
+  return url.protocol === expectedSocketProtocol && url.host === expected.host;
+}
+
+function resolveExpectedRendererOrigin(testInfo: TestInfo): string {
+  const configuredBaseUrl = testInfo.project.use.baseURL;
+  if (typeof configuredBaseUrl !== "string") {
+    throw new Error(
+      "Hosted login evidence requires a configured string baseURL",
+    );
+  }
+  return new URL(configuredBaseUrl).origin;
 }
 
 function classifyConsoleMessage(type: string, rawText: string): string {
@@ -295,6 +351,10 @@ test("hosted login egress policy covers every current auth route family", () => 
     ["POST", "/api/oidc/token"],
     ["GET", "/.well-known/openid-configuration"],
     ["GET", "/api/.well-known/openid-configuration"],
+    ["GET", "/pair"],
+    ["POST", "/api/v1/remote/pair"],
+    ["POST", "/api/whatsapp/pair"],
+    ["POST", "/api/v1/eliza/agents/example/pairing-token"],
     ["GET", "/api/discord/oauth"],
     ["GET", "/api/v1/discord/callback"],
     ["GET", "/api/v1/twitter/callback"],
@@ -355,6 +415,40 @@ test("hosted login egress policy covers every current auth route family", () => 
   expect(isForbiddenLocalDataRequest("GET", "/assets/app.js", "script")).toBe(
     false,
   );
+
+  const expectedOrigin = "http://127.0.0.1:2138";
+  expect(
+    isAllowedInitialLoginDocument(
+      "GET",
+      `${expectedOrigin}/login`,
+      "document",
+      expectedOrigin,
+    ),
+  ).toBe(true);
+  for (const url of [
+    `${expectedOrigin}/login?code=redacted&state=redacted`,
+    `${expectedOrigin}/pair?token=redacted`,
+    "http://127.0.0.1:31337/login",
+    "http://localhost:2138/login",
+    "http://[::1]:2138/login",
+  ]) {
+    expect(
+      isAllowedInitialLoginDocument("GET", url, "document", expectedOrigin),
+      `${url} must not be accepted as the initial login document`,
+    ).toBe(false);
+  }
+  expect(
+    isExpectedRendererResource(
+      "http://127.0.0.1:31337/eliza-renderer-build.json",
+      expectedOrigin,
+    ),
+  ).toBe(false);
+  expect(
+    isExpectedRendererResource(
+      "http://localhost:2138/assets/app.js",
+      expectedOrigin,
+    ),
+  ).toBe(false);
 });
 
 for (const viewport of VIEWPORTS) {
@@ -363,16 +457,20 @@ for (const viewport of VIEWPORTS) {
   }, testInfo) => {
     await page.setViewportSize(viewport);
     const context = page.context();
+    const expectedRendererOrigin = resolveExpectedRendererOrigin(testInfo);
+    const expectedLoginUrl = `${expectedRendererOrigin}/login`;
 
     const frontendEvents: string[] = [];
     const pageErrors: string[] = [];
     const requestFailures: string[] = [];
-    const nonLoopbackRequests: string[] = [];
-    const nonLoopbackWebSockets: string[] = [];
+    const unexpectedOriginRequests: string[] = [];
+    const unexpectedOriginWebSockets: string[] = [];
     const forbiddenAuthWebSockets: string[] = [];
     const unexpectedLocalWebSockets: string[] = [];
     const unexpectedLocalServiceRequests: string[] = [];
     const unexpectedLocalDataRequests: string[] = [];
+    const unexpectedDocumentRequests: string[] = [];
+    const unexpectedMainFrameNavigations: string[] = [];
     const unexpectedPages: string[] = [];
     const forbiddenAuthRequests: string[] = [];
     const consoleErrors: string[] = [];
@@ -394,31 +492,53 @@ for (const viewport of VIEWPORTS) {
       observedPage.on("pageerror", (error) => {
         pageErrors.push(error.name || "Error");
       });
+      observedPage.on("framenavigated", (frame) => {
+        if (
+          observedPage === page &&
+          frame === observedPage.mainFrame() &&
+          frame.url() !== expectedLoginUrl
+        ) {
+          unexpectedMainFrameNavigations.push(
+            "[unexpected-main-frame-navigation]",
+          );
+        }
+      });
     };
     attachPageDiagnostics(page);
     context.on("page", attachPageDiagnostics);
     context.on("request", (request) => {
-      const path = safeResourceLabel(request.url());
+      const path = safeResourceLabel(request.url(), expectedRendererOrigin);
       const pathname = parseUrl(request.url())?.pathname ?? "";
-      if (!isLoopbackOrLocalResource(request.url())) {
-        nonLoopbackRequests.push(`${request.method()}:${path}`);
+      if (!isExpectedRendererResource(request.url(), expectedRendererOrigin)) {
+        unexpectedOriginRequests.push(`${request.method()}:${path}`);
       }
       if (isForbiddenHttpAuthRequest(request.method(), pathname)) {
         forbiddenAuthRequests.push(`${request.method()}:${path}`);
       }
       if (
-        isLoopbackOrLocalResource(request.url()) &&
+        isExpectedRendererResource(request.url(), expectedRendererOrigin) &&
         isForbiddenLocalServiceRequest(request.method(), pathname)
       ) {
         unexpectedLocalServiceRequests.push(`${request.method()}:${path}`);
       }
       if (
-        isLoopbackOrLocalResource(request.url()) &&
+        isExpectedRendererResource(request.url(), expectedRendererOrigin) &&
         isBrowserDataRequest(request.resourceType()) &&
         !isCanonicalProviderDiscovery(request.method(), pathname) &&
         !isRendererManifestRequest(request.method(), pathname)
       ) {
         unexpectedLocalDataRequests.push(`${request.method()}:${path}`);
+      }
+      if (
+        request.resourceType() === "document" &&
+        !isAllowedInitialLoginDocument(
+          request.method(),
+          request.url(),
+          request.resourceType(),
+          expectedRendererOrigin,
+        )
+      ) {
+        unexpectedDocumentRequests.push(`${request.method()}:${path}`);
       }
       if (
         pathname.includes("/assets/wallet-buttons-") ||
@@ -429,7 +549,7 @@ for (const viewport of VIEWPORTS) {
     });
     context.on("requestfailed", (request) => {
       requestFailures.push(
-        `${request.method()}:${safeResourceLabel(request.url())}:${classifyRequestFailure(request.failure()?.errorText)}`,
+        `${request.method()}:${safeResourceLabel(request.url(), expectedRendererOrigin)}:${classifyRequestFailure(request.failure()?.errorText)}`,
       );
     });
     context.on("response", (response) => {
@@ -437,11 +557,11 @@ for (const viewport of VIEWPORTS) {
       const url = parseUrl(response.url());
       const pathname = url?.pathname ?? "";
       frontendEvents.push(
-        `response:${request.method()}:${response.status()}:${safeResourceLabel(response.url())}`,
+        `response:${request.method()}:${response.status()}:${safeResourceLabel(response.url(), expectedRendererOrigin)}`,
       );
       if (response.status() >= 400) {
         httpErrors.push(
-          `${request.method()}:${response.status()}:${safeResourceLabel(response.url())}`,
+          `${request.method()}:${response.status()}:${safeResourceLabel(response.url(), expectedRendererOrigin)}`,
         );
       }
       if (isCanonicalProviderDiscovery(request.method(), pathname)) {
@@ -457,21 +577,24 @@ for (const viewport of VIEWPORTS) {
     await context.routeWebSocket(/.*/, async (webSocket) => {
       const webSocketUrl = webSocket.url();
       const pathname = parseUrl(webSocketUrl)?.pathname ?? "";
-      if (!isLoopbackOrLocalResource(webSocketUrl)) {
-        nonLoopbackWebSockets.push("[external-origin]");
+      if (!isExpectedRendererResource(webSocketUrl, expectedRendererOrigin)) {
+        unexpectedOriginWebSockets.push("[unexpected-origin]");
         await webSocket.close({ code: 1008, reason: "blocked by test policy" });
         return;
       }
       if (isAuthSurface(pathname)) {
-        forbiddenAuthWebSockets.push(`WS:${safeResourceLabel(webSocketUrl)}`);
+        forbiddenAuthWebSockets.push(
+          `WS:${safeResourceLabel(webSocketUrl, expectedRendererOrigin)}`,
+        );
       }
       unexpectedLocalWebSockets.push("WS:[local-resource]");
       await webSocket.close({ code: 1008, reason: "blocked by test policy" });
     });
-    await installProviderFixture(context);
+    await installProviderFixture(context, expectedRendererOrigin);
 
-    await page.goto("/login");
+    await page.goto(expectedLoginUrl);
     await expect(page.getByRole("heading", { name: "Sign in" })).toBeVisible();
+    await expect(page).toHaveURL(expectedLoginUrl);
     const exactRendererCommitVerified = await assertExactEvidenceRenderer(page);
     expect(walletChunkRequests).toBe(0);
     expect(walletChunkResponses).toBe(0);
@@ -545,6 +668,7 @@ for (const viewport of VIEWPORTS) {
       walletMethods.filter((method) => method !== "eth_accounts"),
       "the capability proof must not request accounts or signatures",
     ).toEqual([]);
+    await expect(page).toHaveURL(expectedLoginUrl);
 
     const expectCleanDiagnostics = () => {
       expect(
@@ -564,12 +688,12 @@ for (const viewport of VIEWPORTS) {
         "the capability flow must not receive HTTP errors",
       ).toEqual([]);
       expect(
-        nonLoopbackRequests,
-        "the fixture-backed flow must not reach any external origin",
+        unexpectedOriginRequests,
+        "the fixture-backed flow must not reach any origin other than the exact renderer origin",
       ).toEqual([]);
       expect(
-        nonLoopbackWebSockets,
-        "the fixture-backed flow must not open external WebSockets",
+        unexpectedOriginWebSockets,
+        "the fixture-backed flow must not open WebSockets to another origin",
       ).toEqual([]);
       expect(
         forbiddenAuthWebSockets,
@@ -586,6 +710,14 @@ for (const viewport of VIEWPORTS) {
       expect(
         unexpectedLocalServiceRequests,
         "the capability proof must not reach an unallowlisted local service endpoint",
+      ).toEqual([]);
+      expect(
+        unexpectedDocumentRequests,
+        "the capability proof must not request a second or non-canonical document",
+      ).toEqual([]);
+      expect(
+        unexpectedMainFrameNavigations,
+        "the capability proof must remain on the exact login URL without callback query or fragment state",
       ).toEqual([]);
       expect(
         forbiddenAuthRequests,
@@ -623,13 +755,15 @@ for (const viewport of VIEWPORTS) {
         "assertion:console-errors=0",
         "assertion:request-failures=0",
         "assertion:http-errors=0",
-        "assertion:non-loopback-egress=0",
-        "assertion:non-loopback-websockets=0",
+        "assertion:unexpected-origin-egress=0",
+        "assertion:unexpected-origin-websockets=0",
         "assertion:forbidden-auth-requests=0",
         "assertion:forbidden-auth-websockets=0",
         "assertion:unexpected-local-websockets=0",
         "assertion:unexpected-local-service-requests=0",
         "assertion:unexpected-local-data-requests=0",
+        "assertion:unexpected-document-requests=0",
+        "assertion:unexpected-main-frame-navigations=0",
         "assertion:unexpected-pages=0",
         `assertion:renderer-commit-match=${exactRendererCommitVerified ? "1" : "0"}`,
         `assertion:formal-evidence-mode=${requestedEvidenceHead ? "1" : "0"}`,
