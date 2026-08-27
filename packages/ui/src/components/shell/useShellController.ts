@@ -580,27 +580,43 @@ export function useShellController(): ShellController {
   );
 
   // The persistent shell is the mounted /chat surface, so it owns the one
-  // realtime session. ChatView may still consume the same hook on legacy
-  // embedding surfaces, but the visible shell Talk control must never hand a
-  // failed Cartesia interaction to the unrelated batch Cloud-ASR recorder.
-  const realtimeVoiceBuildEnabled = isRealtimeVoiceFlagEnabled();
+  // realtime session. A healthy conversation-bound probe selects realtime;
+  // when the probe is absent or mismatched, the same Talk control deliberately
+  // remains usable through the batch ASR/TTS path.
+  const realtimeVoiceFlagEnabled = isRealtimeVoiceFlagEnabled();
   const { agentId: realtimeVoiceAgentId, getConsentNonce } =
-    useRealtimeVoiceMint();
-  // The build flag advertises the capability, but only a resolved Dedicated
-  // agent may own Talk. A stale Shared binding has no mintable UUID; retain the
-  // established batch path until signed-in routing repairs it to Dedicated.
-  const realtimeVoiceEnabled =
-    realtimeVoiceBuildEnabled && Boolean(realtimeVoiceAgentId);
+    useRealtimeVoiceMint({ conversationId: activeConversationId });
   const realtimeVoice = useRealtimeVoiceSession({
     agentId: realtimeVoiceAgentId,
     conversationId: activeConversationId,
-    flagEnabled: realtimeVoiceEnabled,
+    // Treat probe/identity loss as an operational flag-off edge. The session
+    // hook's flag effect cancels any pending automatic identity restart before
+    // a fast probe recovery can re-open the microphone without a new gesture.
+    flagEnabled:
+      realtimeVoiceFlagEnabled &&
+      Boolean(realtimeVoiceAgentId && activeConversationId?.trim()),
     getConsentNonce,
     clientOptions: { onServerEvent: handleRealtimeVoiceServerEvent },
   });
+  const realtimeVoiceEnabled =
+    realtimeVoiceFlagEnabled && realtimeVoice.available;
+  const [realtimeVoiceBatchFallback, setRealtimeVoiceBatchFallback] =
+    React.useState(!realtimeVoiceEnabled);
+  const realtimeVoiceSelected =
+    realtimeVoiceEnabled && !realtimeVoiceBatchFallback;
+  // During an identity handoff the availability probe disarms before the old
+  // client finishes teardown. Keep batch media out until that prior owner has
+  // actually released the microphone/audio path.
+  const realtimeVoiceOwnsMedia =
+    realtimeVoiceFlagEnabled &&
+    (realtimeVoiceSelected ||
+      realtimeVoice.active ||
+      realtimeVoice.connecting ||
+      realtimeVoice.agentSpeaking);
   const realtimeVoiceRef = React.useRef(realtimeVoice);
   realtimeVoiceRef.current = realtimeVoice;
   const realtimeVoiceWantedRef = React.useRef(false);
+  const realtimeVoiceWasEnabledRef = React.useRef(realtimeVoiceEnabled);
   // True once the CURRENT wanted session has reached live; distinguishes a
   // mid-session death (parked by the effect below startRealtimeVoice) from an
   // initial start failure (owned by startRealtimeVoice's outcome handling).
@@ -1252,16 +1268,15 @@ export function useShellController(): ShellController {
       // requestSignIn themselves; auto-engage must not pop a login from an
       // effect (that would lose the gesture and fall into same-tab).
       if (authGateRef.current.gated) return;
-      // Cartesia realtime owns conversational Talk end to end. Every legacy
-      // boot/re-listen/wake path converges here, so this guard is the hard
-      // boundary that prevents an effect from silently reopening batch Cloud
-      // ASR while realtime owns or wants the microphone. Explicit long-form
-      // transcription remains a separate, labeled recorder.
+      // Every legacy boot/re-listen/wake path converges here. Route a healthy,
+      // conversation-bound realtime seam to Cartesia, but keep batch closed
+      // while an old realtime owner is still releasing media after a probe or
+      // identity change. A steady negative probe falls through to batch.
       if (
-        realtimeVoiceEnabled &&
+        realtimeVoiceOwnsMedia &&
         (intent === undefined || intent === "converse")
       ) {
-        startRealtimeVoiceRef.current();
+        if (realtimeVoiceSelected) startRealtimeVoiceRef.current();
         return;
       }
       // Voice capture is independent of agent-respond readiness. A converse
@@ -1388,7 +1403,7 @@ export function useShellController(): ShellController {
               // the mic ON — resume the hands-free loop it paused on enter.
               if (resumeHandsFreeAfterTranscriptRef.current) {
                 resumeHandsFreeAfterTranscriptRef.current = false;
-                if (realtimeVoiceEnabled) {
+                if (realtimeVoiceSelected) {
                   startRealtimeVoiceRef.current();
                 } else {
                   setHandsFree(true);
@@ -1562,7 +1577,8 @@ export function useShellController(): ShellController {
         });
     },
     [
-      realtimeVoiceEnabled,
+      realtimeVoiceSelected,
+      realtimeVoiceOwnsMedia,
       send,
       stopCapture,
       finalizeTranscriptSession,
@@ -1678,8 +1694,11 @@ export function useShellController(): ShellController {
       return;
     }
     if (realtimeVoiceEnabled) {
-      if (realtimeVoiceWantedRef.current) stopRealtimeVoiceRef.current();
-      else startRealtimeVoiceRef.current();
+      if (recording || handsFreeRef.current || realtimeVoiceWantedRef.current) {
+        stopRealtimeVoiceRef.current();
+      } else {
+        startRealtimeVoiceRef.current();
+      }
       return;
     }
     if (recording) stopCapture();
@@ -1703,10 +1722,9 @@ export function useShellController(): ShellController {
   // at most once per mount so a later tap-off (which persists "off") isn't
   // re-engaged by this effect re-running.
   React.useEffect(() => {
-    // Realtime restoration is owned below by the Cartesia start boundary. The
-    // batch restore must remain completely inert or it can light a phantom
-    // hands-free state while startCapture correctly refuses Cloud ASR.
-    if (realtimeVoiceEnabled) return;
+    // Batch restore stays inert only while realtime is eligible or still owns
+    // media. A negative conversation probe intentionally restores batch.
+    if (realtimeVoiceOwnsMedia) return;
     if (autoEngagedHandsFreeRef.current) return;
     // Cloud-only signed out: leave the ref unset so a later sign-in retries
     // this restore; auto-engage must not light hands-free against the gate.
@@ -1746,6 +1764,7 @@ export function useShellController(): ShellController {
         return;
       }
       setHandsFree(true);
+      handsFreeRef.current = true;
       setIsOpen(true);
       startCapture("converse");
     });
@@ -1756,7 +1775,7 @@ export function useShellController(): ShellController {
     chatSending,
     startCapture,
     recheckMicPermission,
-    realtimeVoiceEnabled,
+    realtimeVoiceOwnsMedia,
     authGate.gated,
   ]);
 
@@ -1809,7 +1828,7 @@ export function useShellController(): ShellController {
       connected: elizaCloudConnected,
       proxyAvailable: elizaCloudVoiceProxyAvailable,
     }),
-    realtimeVoiceEnabled,
+    realtimeVoiceEnabled: realtimeVoiceOwnsMedia,
   });
   // Wire the forward ref so the conversation-switch / clear handlers (defined
   // above `voiceOutput`) can stop in-flight assistant speech at gesture time.
@@ -1829,17 +1848,18 @@ export function useShellController(): ShellController {
   // after the mic opens (which flips phase to "listening"), so the composer-send
   // and voice-gating logic both read one honest "a reply is in flight" signal.
   const realtimeVoiceResponding =
-    realtimeVoiceEnabled &&
+    realtimeVoiceOwnsMedia &&
     (realtimeVoice.status === "thinking" ||
       realtimeVoice.status === "speaking" ||
       realtimeVoice.status === "interrupting");
   const realtimeVoiceListening =
-    realtimeVoiceEnabled &&
+    realtimeVoiceOwnsMedia &&
     (realtimeVoice.connecting ||
       realtimeVoice.status === "listening" ||
       realtimeVoice.status === "transcribing");
   const realtimeVoiceRecording =
-    realtimeVoiceEnabled && (realtimeVoice.active || realtimeVoice.connecting);
+    realtimeVoiceOwnsMedia &&
+    (realtimeVoice.active || realtimeVoice.connecting);
   const responding =
     chatSending || voiceOutput.speaking || realtimeVoiceResponding;
 
@@ -1853,7 +1873,7 @@ export function useShellController(): ShellController {
     if (voiceOutput.speaking || realtimeVoice.agentSpeaking) {
       return { kind: "speaking" };
     }
-    if (realtimeVoiceEnabled && realtimeVoice.status === "thinking") {
+    if (realtimeVoiceOwnsMedia && realtimeVoice.status === "thinking") {
       return { kind: "thinking" };
     }
     if (
@@ -1870,7 +1890,7 @@ export function useShellController(): ShellController {
     voiceOutput.speaking,
     realtimeVoice.agentSpeaking,
     realtimeVoice.status,
-    realtimeVoiceEnabled,
+    realtimeVoiceOwnsMedia,
     serverTurnStatus,
     chatSending,
     chatFirstTokenReceived,
@@ -1989,6 +2009,7 @@ export function useShellController(): ShellController {
   const startRealtimeVoice = React.useCallback(async () => {
     if (authGateRef.current.gated) return;
     if (!realtimeVoiceEnabled) return;
+    if (captureRef.current || recording) return;
     if (
       realtimeVoiceWantedRef.current ||
       realtimeVoiceRef.current.active ||
@@ -1996,6 +2017,7 @@ export function useShellController(): ShellController {
     ) {
       return;
     }
+    setRealtimeVoiceBatchFallback(false);
 
     const prior = loadContinuousChatMode();
     if (prior !== "always-on") priorContinuousModeRef.current = prior;
@@ -2050,6 +2072,7 @@ export function useShellController(): ShellController {
   }, [
     ensureActiveConversationForVoice,
     realtimeVoiceEnabled,
+    recording,
     setActionNotice,
     stopCapture,
   ]);
@@ -2057,6 +2080,58 @@ export function useShellController(): ShellController {
     void startRealtimeVoice();
   };
   stopRealtimeVoiceRef.current = stopRealtimeVoice;
+
+  // Availability is conversation-scoped. If the active conversation stops
+  // matching the local gateway, latch this Talk session onto batch ASR/TTS.
+  // A later positive probe must not steal a batch turn between capture, text,
+  // and playback; realtime becomes selectable again only after Talk is off and
+  // every batch owner is idle.
+  React.useEffect(() => {
+    const wasEnabled = realtimeVoiceWasEnabledRef.current;
+    realtimeVoiceWasEnabledRef.current = realtimeVoiceEnabled;
+
+    if (wasEnabled && !realtimeVoiceEnabled) {
+      const shouldContinue =
+        realtimeVoiceWantedRef.current ||
+        realtimeVoice.active ||
+        realtimeVoice.connecting;
+      realtimeVoiceWantedRef.current = false;
+      realtimeVoiceWasActiveRef.current = false;
+      setRealtimeVoiceBatchFallback(true);
+      setRealtimeVoiceBoundaryError(null);
+      if (shouldContinue) {
+        setHandsFree(true);
+        handsFreeRef.current = true;
+        setIsOpen(true);
+      }
+    }
+
+    if (!realtimeVoiceEnabled || !realtimeVoiceBatchFallback) return;
+    if (
+      authGate.gated ||
+      handsFree ||
+      realtimeVoice.active ||
+      realtimeVoice.connecting ||
+      captureRef.current ||
+      recording ||
+      chatSending ||
+      voiceOutput.speaking
+    ) {
+      return;
+    }
+
+    setRealtimeVoiceBatchFallback(false);
+  }, [
+    authGate.gated,
+    chatSending,
+    handsFree,
+    realtimeVoice.active,
+    realtimeVoiceBatchFallback,
+    realtimeVoice.connecting,
+    realtimeVoiceEnabled,
+    recording,
+    voiceOutput.speaking,
+  ]);
 
   const stopRecording = React.useCallback(() => {
     if (
@@ -2084,7 +2159,7 @@ export function useShellController(): ShellController {
     if (realtimeVoice.active) realtimeVoiceWasActiveRef.current = true;
   }, [realtimeVoice.active]);
   React.useEffect(() => {
-    if (!realtimeVoiceEnabled) return;
+    if (!realtimeVoiceSelected) return;
     if (!realtimeVoice.error) return;
     if (realtimeVoice.active || realtimeVoice.connecting) return;
     if (!realtimeVoiceWasActiveRef.current) return;
@@ -2096,24 +2171,24 @@ export function useShellController(): ShellController {
     handsFreeRef.current = false;
     setActionNotice(realtimeVoice.error.message, "error", 6000);
   }, [
-    realtimeVoiceEnabled,
+    realtimeVoiceSelected,
     realtimeVoice.error,
     realtimeVoice.active,
     realtimeVoice.connecting,
     setActionNotice,
   ]);
 
-  // Persisted always-on remains one setting across providers, but Cartesia owns
-  // its own restoration path. In particular, no batch recorder is opened while
-  // realtime is selected or waiting for its health/identity seam to settle.
+  // Persisted always-on remains one setting across providers. Once the
+  // conversation-bound probe is eligible, Cartesia reclaims an idle Talk loop;
+  // a negative probe leaves the batch restoration path authoritative.
   React.useEffect(() => {
-    if (!realtimeVoiceEnabled || autoEngagedHandsFreeRef.current) return;
+    if (!realtimeVoiceSelected || autoEngagedHandsFreeRef.current) return;
     if (!ready || chatSending || realtimeVoice.connecting) return;
     if (loadContinuousChatMode() !== "always-on") return;
     autoEngagedHandsFreeRef.current = true;
     priorContinuousModeRef.current = "off";
     startRealtimeVoiceRef.current();
-  }, [chatSending, ready, realtimeVoice.connecting, realtimeVoiceEnabled]);
+  }, [chatSending, ready, realtimeVoice.connecting, realtimeVoiceSelected]);
 
   // Tap-to-talk: toggle a hands-free conversation. Enabling unlocks audio (the
   // tap is the gesture) and opens the mic in "converse" mode; disabling stops
@@ -2125,6 +2200,7 @@ export function useShellController(): ShellController {
     }
     if (realtimeVoiceEnabled) {
       if (
+        handsFreeRef.current ||
         realtimeVoiceWantedRef.current ||
         realtimeVoiceRef.current.active ||
         realtimeVoiceRef.current.connecting
@@ -2140,6 +2216,7 @@ export function useShellController(): ShellController {
       // "vad-gated" choice survives) and stop the mic + any in-flight reply.
       saveContinuousChatMode(priorContinuousModeRef.current);
       setHandsFree(false);
+      handsFreeRef.current = false;
       if (captureRef.current) stopCapture();
       voiceOutput.stopSpeaking();
     } else {
@@ -2205,7 +2282,7 @@ export function useShellController(): ShellController {
         if (continuous === "always-on") {
           if (handsFreeRef.current) return;
           priorContinuousModeRef.current = "off";
-          if (realtimeVoiceEnabled) {
+          if (realtimeVoiceSelected) {
             startRealtimeVoiceRef.current();
             return;
           }
@@ -2218,7 +2295,7 @@ export function useShellController(): ShellController {
 
         priorContinuousModeRef.current = continuous;
         if (!handsFreeRef.current) return;
-        if (realtimeVoiceEnabled) {
+        if (realtimeVoiceSelected) {
           stopRealtimeVoiceRef.current();
           return;
         }
@@ -2228,7 +2305,7 @@ export function useShellController(): ShellController {
         voiceOutput.stopSpeaking();
       },
       [
-        realtimeVoiceEnabled,
+        realtimeVoiceSelected,
         responding,
         startCapture,
         stopCapture,
@@ -2261,7 +2338,7 @@ export function useShellController(): ShellController {
       // the subscription. The callback itself is the final boundary.
       if (authGateRef.current.gated) return;
       setIsOpen(true);
-      if (realtimeVoiceEnabled) {
+      if (realtimeVoiceSelected) {
         startRealtimeVoiceRef.current();
         return;
       }
@@ -2269,17 +2346,17 @@ export function useShellController(): ShellController {
       handsFreeRef.current = true;
       voiceOutput.unlockAudio();
       if (!responding && !captureRef.current) startCapture("converse");
-    }, [realtimeVoiceEnabled, responding, startCapture, voiceOutput]),
+    }, [realtimeVoiceSelected, responding, startCapture, voiceOutput]),
     onClose: React.useCallback(() => {
       // Close the temporary window without disturbing a persisted mode.
-      if (realtimeVoiceEnabled) {
+      if (realtimeVoiceSelected) {
         stopRealtimeVoiceRef.current();
         return;
       }
       setHandsFree(false);
       handsFreeRef.current = false;
       if (captureRef.current) stopCapture();
-    }, [realtimeVoiceEnabled, stopCapture]),
+    }, [realtimeVoiceSelected, stopCapture]),
   });
 
   // Toggle transcription mode (long-form, record-only — the agent never replies
@@ -2305,7 +2382,7 @@ export function useShellController(): ShellController {
       // button — handleMicClick → stopTranscriptionAndMic — turns the mic off.)
       if (resumeHandsFreeAfterTranscriptRef.current) {
         resumeHandsFreeAfterTranscriptRef.current = false;
-        if (realtimeVoiceEnabled) {
+        if (realtimeVoiceSelected) {
           startRealtimeVoiceRef.current();
         } else {
           setHandsFree(true);
@@ -2319,7 +2396,7 @@ export function useShellController(): ShellController {
       // disables the mic.
       resumeHandsFreeAfterTranscriptRef.current = handsFreeRef.current;
       if (handsFreeRef.current) {
-        if (realtimeVoiceEnabled) {
+        if (realtimeVoiceSelected) {
           stopRealtimeVoiceRef.current();
         } else {
           setHandsFree(false);
@@ -2345,7 +2422,7 @@ export function useShellController(): ShellController {
     voiceOutput,
     beginTranscriptSession,
     finalizeTranscriptSession,
-    realtimeVoiceEnabled,
+    realtimeVoiceSelected,
     recoverGatedCapture,
   ]);
 
@@ -2481,7 +2558,7 @@ export function useShellController(): ShellController {
   // Paused while the composer holds a draft (typing → always-on off), so a send
   // that clears the draft re-arms it and returns to the prior voice state.
   React.useEffect(() => {
-    if (realtimeVoiceEnabled) return;
+    if (realtimeVoiceOwnsMedia) return;
     if (!handsFree || !ready) return;
     if (recording || captureRef.current) return;
     if (chatSending || voiceOutput.speaking) return;
@@ -2507,7 +2584,7 @@ export function useShellController(): ShellController {
     voiceOutput.speaking,
     composerHasDraft,
     startCapture,
-    realtimeVoiceEnabled,
+    realtimeVoiceOwnsMedia,
   ]);
 
   // ── App suspend / resume: keep voice capture from getting stuck (#voice-V1) ──
@@ -2538,7 +2615,7 @@ export function useShellController(): ShellController {
     const onResume = (): void => {
       // The realtime client owns visibility suspend/resume for its socket,
       // AudioContext, and microphone. Never overlay a batch recorder on it.
-      if (realtimeVoiceEnabled) return;
+      if (realtimeVoiceOwnsMedia) return;
       const shouldReArm =
         (wasCapturingAtSuspendRef.current || handsFreeRef.current) &&
         !transcriptionModeRef.current;
@@ -2572,7 +2649,7 @@ export function useShellController(): ShellController {
     recording,
     chatSending,
     voiceOutput.speaking,
-    realtimeVoiceEnabled,
+    realtimeVoiceOwnsMedia,
   ]);
 
   const waveformMode =
@@ -2583,7 +2660,11 @@ export function useShellController(): ShellController {
         : "idle";
 
   let realtimeVoiceErrorMessage = realtimeVoiceBoundaryError;
-  if (!realtimeVoiceErrorMessage && realtimeVoice.error) {
+  if (
+    !realtimeVoiceErrorMessage &&
+    realtimeVoiceOwnsMedia &&
+    realtimeVoice.error
+  ) {
     if (realtimeVoice.error.kind === "consent") {
       realtimeVoiceErrorMessage =
         "Cartesia voice could not confirm microphone consent. Tap Talk to retry.";
@@ -2596,7 +2677,7 @@ export function useShellController(): ShellController {
   }
   const unlockVoiceAudio = React.useCallback(() => {
     if (
-      realtimeVoiceEnabled &&
+      realtimeVoiceOwnsMedia &&
       (realtimeVoiceWantedRef.current ||
         realtimeVoiceRef.current.active ||
         realtimeVoiceRef.current.connecting)
@@ -2605,7 +2686,7 @@ export function useShellController(): ShellController {
       return;
     }
     voiceOutput.unlockAudio();
-  }, [realtimeVoiceEnabled, voiceOutput.unlockAudio]);
+  }, [realtimeVoiceOwnsMedia, voiceOutput.unlockAudio]);
 
   // Accept input while the agent is still booting; pre-ready sends queue (see
   // `send`) and flush on ready. Send stays enabled mid-response: typing + sending
@@ -2694,7 +2775,7 @@ export function useShellController(): ShellController {
     cancelRecording: cancelCapture,
     handsFree,
     realtimeVoice: {
-      enabled: realtimeVoiceEnabled,
+      enabled: realtimeVoiceSelected,
       active: realtimeVoice.active,
       connecting: realtimeVoice.connecting,
       paused: realtimeVoice.paused,
@@ -2727,7 +2808,7 @@ export function useShellController(): ShellController {
     agentVoiceMuted: voiceOutput.agentVoiceMuted,
     toggleAgentVoiceMute: voiceOutput.toggleAgentVoiceMute,
     needsAudioUnlock:
-      (realtimeVoiceEnabled &&
+      (realtimeVoiceOwnsMedia &&
         (realtimeVoice.active || realtimeVoice.connecting) &&
         realtimeVoice.needsUnlock) ||
       voiceOutput.needsAudioUnlock,
