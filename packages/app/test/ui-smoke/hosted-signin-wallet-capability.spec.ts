@@ -9,7 +9,8 @@ import { saveBrowserVideoArtifact } from "./helpers/video-artifacts";
 
 test.use({ video: { mode: "on", size: { width: 1440, height: 900 } } });
 
-const requestedEvidenceHead = process.env.ELIZA_PR_EVIDENCE_HEAD?.trim();
+const requestedEvidenceHead =
+  process.env.ELIZA_PR_EVIDENCE_HEAD?.trim().toLowerCase();
 if (requestedEvidenceHead && !/^[a-f0-9]{40}$/i.test(requestedEvidenceHead)) {
   throw new Error("ELIZA_PR_EVIDENCE_HEAD must be a full commit SHA");
 }
@@ -58,12 +59,25 @@ async function installProviderFixture(page: Page): Promise<void> {
       value: ethereum,
     });
   });
-  await page.route("**/auth/providers", async (route) => {
-    await route.fulfill({
-      status: 200,
-      contentType: "application/json",
-      body: JSON.stringify(SIWE_ONLY_PROVIDERS),
-    });
+  // This catch-all is installed before navigation, so unexpected wallet RPC,
+  // WalletConnect, OAuth, or provider traffic is aborted before network egress
+  // instead of merely being noticed after transmission.
+  await page.route("**/*", async (route) => {
+    const requestUrl = route.request().url();
+    const pathname = parseUrl(requestUrl)?.pathname ?? "";
+    if (pathname.endsWith("/auth/providers")) {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify(SIWE_ONLY_PROVIDERS),
+      });
+      return;
+    }
+    if (!isLoopbackOrLocalResource(requestUrl)) {
+      await route.abort("blockedbyclient");
+      return;
+    }
+    await route.fallback();
   });
 }
 
@@ -75,12 +89,13 @@ function parseUrl(rawUrl: string): URL | null {
   }
 }
 
-function safePath(rawUrl: string): string {
+function safeResourceLabel(rawUrl: string): string {
   const url = parseUrl(rawUrl);
   if (!url) return "[unparseable-url]";
   if (url.protocol === "data:" || url.protocol === "blob:") {
     return `[${url.protocol.slice(0, -1)}-url]`;
   }
+  if (!isLoopbackOrLocalResource(rawUrl)) return "[external-origin]";
   return `${url.origin}${url.pathname}`;
 }
 
@@ -89,7 +104,10 @@ function isLoopbackOrLocalResource(rawUrl: string): boolean {
   if (!url) return false;
   if (url.protocol === "data:" || url.protocol === "blob:") return true;
   return (
-    (url.protocol === "http:" || url.protocol === "https:") &&
+    (url.protocol === "http:" ||
+      url.protocol === "https:" ||
+      url.protocol === "ws:" ||
+      url.protocol === "wss:") &&
     (url.hostname === "127.0.0.1" ||
       url.hostname === "localhost" ||
       url.hostname === "[::1]")
@@ -108,6 +126,33 @@ function classifyConsoleMessage(type: string, rawText: string): string {
   return `console:${type}:[redacted-${rawText.length}-character-message]`;
 }
 
+function classifyRequestFailure(rawText: string | undefined): string {
+  if (rawText && /^net::[A-Z0-9_]+$/i.test(rawText)) return rawText;
+  return "[redacted-request-failure]";
+}
+
+async function assertExactEvidenceRenderer(page: Page): Promise<boolean> {
+  if (!requestedEvidenceHead) return false;
+
+  await expect
+    .poll(
+      () =>
+        page.evaluate(() => {
+          const stamp = Reflect.get(window, "__ELIZA_RENDERER_BUILD__");
+          if (stamp === null || typeof stamp !== "object") return null;
+          const commit = Reflect.get(stamp, "commit");
+          return typeof commit === "string" ? commit : null;
+        }),
+      {
+        message:
+          "the rendered bundle must be stamped with ELIZA_PR_EVIDENCE_HEAD",
+        timeout: 15_000,
+      },
+    )
+    .toBe(requestedEvidenceHead);
+  return true;
+}
+
 for (const viewport of VIEWPORTS) {
   test(`lazy wallet stack preserves SIWE-only discovery at ${viewport.name}`, async ({
     page,
@@ -119,6 +164,7 @@ for (const viewport of VIEWPORTS) {
     const pageErrors: string[] = [];
     const requestFailures: string[] = [];
     const nonLoopbackRequests: string[] = [];
+    const nonLoopbackWebSockets: string[] = [];
     const forbiddenAuthRequests: string[] = [];
     const consoleErrors: string[] = [];
     const httpErrors: string[] = [];
@@ -133,17 +179,21 @@ for (const viewport of VIEWPORTS) {
       pageErrors.push(error.name || "Error");
     });
     page.on("request", (request) => {
-      const path = safePath(request.url());
+      const path = safeResourceLabel(request.url());
+      const pathname = parseUrl(request.url())?.pathname ?? "";
       if (!isLoopbackOrLocalResource(request.url())) {
         nonLoopbackRequests.push(`${request.method()}:${path}`);
       }
-      if (/\/auth\/(?:siwe|siws|oauth)\//i.test(path)) {
+      if (
+        /\/auth(?:\/|$)/i.test(pathname) &&
+        !pathname.endsWith("/auth/providers")
+      ) {
         forbiddenAuthRequests.push(`${request.method()}:${path}`);
       }
     });
     page.on("requestfailed", (request) => {
       requestFailures.push(
-        `${request.method()}:${safePath(request.url())}:${request.failure()?.errorText ?? "unknown"}`,
+        `${request.method()}:${safeResourceLabel(request.url())}:${classifyRequestFailure(request.failure()?.errorText)}`,
       );
     });
     page.on("response", (response) => {
@@ -151,11 +201,11 @@ for (const viewport of VIEWPORTS) {
       const url = parseUrl(response.url());
       const pathname = url?.pathname ?? "";
       frontendEvents.push(
-        `response:${request.method()}:${response.status()}:${safePath(response.url())}`,
+        `response:${request.method()}:${response.status()}:${safeResourceLabel(response.url())}`,
       );
       if (response.status() >= 400) {
         httpErrors.push(
-          `${request.method()}:${response.status()}:${safePath(response.url())}`,
+          `${request.method()}:${response.status()}:${safeResourceLabel(response.url())}`,
         );
       }
       if (pathname.endsWith("/steward/auth/providers")) {
@@ -168,9 +218,18 @@ for (const viewport of VIEWPORTS) {
         walletChunkResponses += 1;
       }
     });
+    await page.routeWebSocket(/.*/, async (webSocket) => {
+      if (!isLoopbackOrLocalResource(webSocket.url())) {
+        nonLoopbackWebSockets.push("[external-origin]");
+        await webSocket.close({ code: 1008, reason: "blocked by test policy" });
+        return;
+      }
+      webSocket.connectToServer();
+    });
 
     await page.goto("/login");
     await expect(page.getByRole("heading", { name: "Sign in" })).toBeVisible();
+    const exactRendererCommitVerified = await assertExactEvidenceRenderer(page);
     expect(walletChunkResponses).toBe(0);
 
     const walletToggle = page.getByRole("button", {
@@ -253,6 +312,10 @@ for (const viewport of VIEWPORTS) {
         "the fixture-backed flow must not reach any external origin",
       ).toEqual([]);
       expect(
+        nonLoopbackWebSockets,
+        "the fixture-backed flow must not open external WebSockets",
+      ).toEqual([]);
+      expect(
         forbiddenAuthRequests,
         "the capability proof must not start OAuth or wallet auth",
       ).toEqual([]);
@@ -285,7 +348,9 @@ for (const viewport of VIEWPORTS) {
         "assertion:request-failures=0",
         "assertion:http-errors=0",
         "assertion:non-loopback-egress=0",
+        "assertion:non-loopback-websockets=0",
         "assertion:forbidden-auth-requests=0",
+        `assertion:renderer-commit-match=${exactRendererCommitVerified ? "1" : "not-requested"}`,
         `assertion:provider-discovery-responses=${providerDiscoveryResponses}`,
         `assertion:wallet-chunk-responses=${walletChunkResponses}`,
         `assertion:wallet-methods=${walletMethods.join(",")}`,
