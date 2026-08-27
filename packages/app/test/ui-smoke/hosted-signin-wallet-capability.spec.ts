@@ -3,18 +3,54 @@
  * capability boundary. The lightweight disclosure and the lazy wallet stack
  * must both obey the same provider discovery response.
  */
+import { execFileSync } from "node:child_process";
 import { writeFile } from "node:fs/promises";
-import { expect, type Page, test } from "@playwright/test";
+import path from "node:path";
+import { type BrowserContext, expect, type Page, test } from "@playwright/test";
 import { saveBrowserVideoArtifact } from "./helpers/video-artifacts";
 
-test.use({ video: { mode: "on", size: { width: 1440, height: 900 } } });
+test.use({
+  screenshot: "off",
+  trace: "off",
+  video: { mode: "on", size: { width: 1440, height: 900 } },
+});
+
+const REPO_ROOT = path.resolve(import.meta.dirname, "../../../..");
+
+function gitOutput(args: readonly string[]): string {
+  return execFileSync("git", args, {
+    cwd: REPO_ROOT,
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+  }).trim();
+}
+
+const repositoryHead = gitOutput(["rev-parse", "HEAD"]).toLowerCase();
+if (!/^[a-f0-9]{40}$/.test(repositoryHead)) {
+  throw new Error(
+    "Could not resolve a full repository HEAD for renderer proof",
+  );
+}
 
 const requestedEvidenceHead =
   process.env.ELIZA_PR_EVIDENCE_HEAD?.trim().toLowerCase();
 if (requestedEvidenceHead && !/^[a-f0-9]{40}$/i.test(requestedEvidenceHead)) {
   throw new Error("ELIZA_PR_EVIDENCE_HEAD must be a full commit SHA");
 }
-const EVIDENCE_REVISION = requestedEvidenceHead?.slice(0, 12) ?? "local";
+if (requestedEvidenceHead && requestedEvidenceHead !== repositoryHead) {
+  throw new Error(
+    `ELIZA_PR_EVIDENCE_HEAD ${requestedEvidenceHead} does not match checked-out HEAD ${repositoryHead}`,
+  );
+}
+if (
+  requestedEvidenceHead &&
+  gitOutput(["status", "--porcelain=v1", "--untracked-files=normal"]).length > 0
+) {
+  throw new Error(
+    "Formal PR evidence requires a clean worktree at ELIZA_PR_EVIDENCE_HEAD",
+  );
+}
+const EVIDENCE_REVISION = repositoryHead.slice(0, 12);
 
 const VIEWPORTS = [
   { name: "desktop", width: 1440, height: 900 },
@@ -35,11 +71,31 @@ const SIWE_ONLY_PROVIDERS = {
   oauth: [],
 };
 
-async function installProviderFixture(page: Page): Promise<void> {
+function isCanonicalProviderDiscovery(
+  method: string,
+  pathname: string,
+): boolean {
+  return method === "GET" && pathname === "/steward/auth/providers";
+}
+
+function isAuthSurface(pathname: string): boolean {
+  return (
+    /\/auth(?:\/|$)/i.test(pathname) ||
+    /^\/api\/cloud\/login(?:\/|$)/i.test(pathname)
+  );
+}
+
+function isForbiddenHttpAuthRequest(method: string, pathname: string): boolean {
+  return (
+    isAuthSurface(pathname) && !isCanonicalProviderDiscovery(method, pathname)
+  );
+}
+
+async function installProviderFixture(context: BrowserContext): Promise<void> {
   // Keep the provider-backed intent pending after the lazy boundary. The test
   // proves capability rendering, not an account authorization, and must not
   // open a real wallet or paint a synthetic connection failure into evidence.
-  await page.addInitScript(() => {
+  await context.addInitScript(() => {
     const methods: string[] = [];
     Object.defineProperty(window, "__elizaWalletCapabilityMethods", {
       configurable: true,
@@ -62,10 +118,14 @@ async function installProviderFixture(page: Page): Promise<void> {
   // This catch-all is installed before navigation, so unexpected wallet RPC,
   // WalletConnect, OAuth, or provider traffic is aborted before network egress
   // instead of merely being noticed after transmission.
-  await page.route("**/*", async (route) => {
+  await context.route("**/*", async (route) => {
     const requestUrl = route.request().url();
     const pathname = parseUrl(requestUrl)?.pathname ?? "";
-    if (pathname.endsWith("/auth/providers")) {
+    if (!isLoopbackOrLocalResource(requestUrl)) {
+      await route.abort("blockedbyclient");
+      return;
+    }
+    if (isCanonicalProviderDiscovery(route.request().method(), pathname)) {
       await route.fulfill({
         status: 200,
         contentType: "application/json",
@@ -73,7 +133,7 @@ async function installProviderFixture(page: Page): Promise<void> {
       });
       return;
     }
-    if (!isLoopbackOrLocalResource(requestUrl)) {
+    if (isForbiddenHttpAuthRequest(route.request().method(), pathname)) {
       await route.abort("blockedbyclient");
       return;
     }
@@ -96,7 +156,23 @@ function safeResourceLabel(rawUrl: string): string {
     return `[${url.protocol.slice(0, -1)}-url]`;
   }
   if (!isLoopbackOrLocalResource(rawUrl)) return "[external-origin]";
-  return `${url.origin}${url.pathname}`;
+  if (url.pathname === "/login") return "[login-route]";
+  if (url.pathname === "/eliza-renderer-build.json") {
+    return "[renderer-manifest]";
+  }
+  if (url.pathname === "/steward/auth/providers") {
+    return "[provider-discovery]";
+  }
+  if (
+    url.pathname.includes("/assets/wallet-buttons-") ||
+    url.pathname.includes("/assets/steward-wallet-providers-")
+  ) {
+    return "[wallet-chunk]";
+  }
+  if (url.pathname.startsWith("/assets/")) return "[local-asset]";
+  // Unknown loopback paths can still contain callback codes, session ids, or
+  // other credentials. Keep them useful only as a resource class.
+  return "[local-resource]";
 }
 
 function isLoopbackOrLocalResource(rawUrl: string): boolean {
@@ -132,8 +208,6 @@ function classifyRequestFailure(rawText: string | undefined): string {
 }
 
 async function assertExactEvidenceRenderer(page: Page): Promise<boolean> {
-  if (!requestedEvidenceHead) return false;
-
   await expect
     .poll(
       () =>
@@ -145,11 +219,11 @@ async function assertExactEvidenceRenderer(page: Page): Promise<boolean> {
         }),
       {
         message:
-          "the rendered bundle must be stamped with ELIZA_PR_EVIDENCE_HEAD",
+          "the rendered bundle must be stamped with checked-out repository HEAD",
         timeout: 15_000,
       },
     )
-    .toBe(requestedEvidenceHead);
+    .toBe(repositoryHead);
   return true;
 }
 
@@ -158,45 +232,60 @@ for (const viewport of VIEWPORTS) {
     page,
   }, testInfo) => {
     await page.setViewportSize(viewport);
-    await installProviderFixture(page);
+    const context = page.context();
 
     const frontendEvents: string[] = [];
     const pageErrors: string[] = [];
     const requestFailures: string[] = [];
     const nonLoopbackRequests: string[] = [];
     const nonLoopbackWebSockets: string[] = [];
+    const forbiddenAuthWebSockets: string[] = [];
+    const unexpectedPages: string[] = [];
     const forbiddenAuthRequests: string[] = [];
     const consoleErrors: string[] = [];
     const httpErrors: string[] = [];
     let providerDiscoveryResponses = 0;
+    let walletChunkRequests = 0;
     let walletChunkResponses = 0;
-    page.on("console", (message) => {
-      const classified = classifyConsoleMessage(message.type(), message.text());
-      frontendEvents.push(classified);
-      if (message.type() === "error") consoleErrors.push(classified);
-    });
-    page.on("pageerror", (error) => {
-      pageErrors.push(error.name || "Error");
-    });
-    page.on("request", (request) => {
+
+    const attachPageDiagnostics = (observedPage: Page) => {
+      if (observedPage !== page) unexpectedPages.push("[additional-page]");
+      observedPage.on("console", (message) => {
+        const classified = classifyConsoleMessage(
+          message.type(),
+          message.text(),
+        );
+        frontendEvents.push(classified);
+        if (message.type() === "error") consoleErrors.push(classified);
+      });
+      observedPage.on("pageerror", (error) => {
+        pageErrors.push(error.name || "Error");
+      });
+    };
+    attachPageDiagnostics(page);
+    context.on("page", attachPageDiagnostics);
+    context.on("request", (request) => {
       const path = safeResourceLabel(request.url());
       const pathname = parseUrl(request.url())?.pathname ?? "";
       if (!isLoopbackOrLocalResource(request.url())) {
         nonLoopbackRequests.push(`${request.method()}:${path}`);
       }
-      if (
-        /\/auth(?:\/|$)/i.test(pathname) &&
-        !pathname.endsWith("/auth/providers")
-      ) {
+      if (isForbiddenHttpAuthRequest(request.method(), pathname)) {
         forbiddenAuthRequests.push(`${request.method()}:${path}`);
       }
+      if (
+        pathname.includes("/assets/wallet-buttons-") ||
+        pathname.includes("/assets/steward-wallet-providers-")
+      ) {
+        walletChunkRequests += 1;
+      }
     });
-    page.on("requestfailed", (request) => {
+    context.on("requestfailed", (request) => {
       requestFailures.push(
         `${request.method()}:${safeResourceLabel(request.url())}:${classifyRequestFailure(request.failure()?.errorText)}`,
       );
     });
-    page.on("response", (response) => {
+    context.on("response", (response) => {
       const request = response.request();
       const url = parseUrl(response.url());
       const pathname = url?.pathname ?? "";
@@ -208,7 +297,7 @@ for (const viewport of VIEWPORTS) {
           `${request.method()}:${response.status()}:${safeResourceLabel(response.url())}`,
         );
       }
-      if (pathname.endsWith("/steward/auth/providers")) {
+      if (isCanonicalProviderDiscovery(request.method(), pathname)) {
         providerDiscoveryResponses += 1;
       }
       if (
@@ -218,18 +307,27 @@ for (const viewport of VIEWPORTS) {
         walletChunkResponses += 1;
       }
     });
-    await page.routeWebSocket(/.*/, async (webSocket) => {
-      if (!isLoopbackOrLocalResource(webSocket.url())) {
+    await context.routeWebSocket(/.*/, async (webSocket) => {
+      const webSocketUrl = webSocket.url();
+      const pathname = parseUrl(webSocketUrl)?.pathname ?? "";
+      if (!isLoopbackOrLocalResource(webSocketUrl)) {
         nonLoopbackWebSockets.push("[external-origin]");
+        await webSocket.close({ code: 1008, reason: "blocked by test policy" });
+        return;
+      }
+      if (isAuthSurface(pathname)) {
+        forbiddenAuthWebSockets.push(`WS:${safeResourceLabel(webSocketUrl)}`);
         await webSocket.close({ code: 1008, reason: "blocked by test policy" });
         return;
       }
       webSocket.connectToServer();
     });
+    await installProviderFixture(context);
 
     await page.goto("/login");
     await expect(page.getByRole("heading", { name: "Sign in" })).toBeVisible();
     const exactRendererCommitVerified = await assertExactEvidenceRenderer(page);
+    expect(walletChunkRequests).toBe(0);
     expect(walletChunkResponses).toBe(0);
 
     const walletToggle = page.getByRole("button", {
@@ -247,9 +345,20 @@ for (const viewport of VIEWPORTS) {
     await expect(evmButton).toBeVisible();
     await expect(solanaButton).toHaveCount(0);
     expect(
+      walletChunkRequests,
+      "wallet chunks must not be requested after disclosure alone",
+    ).toBe(0);
+    expect(
       walletChunkResponses,
       "wallet chunks must remain lazy after disclosure alone",
     ).toBe(0);
+    expect(
+      await page.evaluate(() => {
+        const methods = Reflect.get(window, "__elizaWalletCapabilityMethods");
+        return Array.isArray(methods) ? methods : [];
+      }),
+      "wallet discovery must not run before explicit chain intent",
+    ).toEqual([]);
 
     await page.screenshot({
       path: testInfo.outputPath(
@@ -275,6 +384,7 @@ for (const viewport of VIEWPORTS) {
     await expect(solanaButton).toHaveCount(0);
     await expect(page.getByRole("alert")).toHaveCount(0);
     expect(providerDiscoveryResponses).toBe(1);
+    expect(walletChunkRequests).toBeGreaterThanOrEqual(2);
     expect(walletChunkResponses).toBeGreaterThanOrEqual(2);
     const walletMethods = await page.evaluate(() => {
       const methods = Reflect.get(window, "__elizaWalletCapabilityMethods");
@@ -316,8 +426,16 @@ for (const viewport of VIEWPORTS) {
         "the fixture-backed flow must not open external WebSockets",
       ).toEqual([]);
       expect(
+        forbiddenAuthWebSockets,
+        "the capability proof must not open an auth WebSocket",
+      ).toEqual([]);
+      expect(
         forbiddenAuthRequests,
         "the capability proof must not start OAuth or wallet auth",
+      ).toEqual([]);
+      expect(
+        unexpectedPages,
+        "the capability proof must not open a popup or secondary page",
       ).toEqual([]);
     };
     expectCleanDiagnostics();
@@ -350,8 +468,12 @@ for (const viewport of VIEWPORTS) {
         "assertion:non-loopback-egress=0",
         "assertion:non-loopback-websockets=0",
         "assertion:forbidden-auth-requests=0",
-        `assertion:renderer-commit-match=${exactRendererCommitVerified ? "1" : "not-requested"}`,
+        "assertion:forbidden-auth-websockets=0",
+        "assertion:unexpected-pages=0",
+        `assertion:renderer-commit-match=${exactRendererCommitVerified ? "1" : "0"}`,
+        `assertion:formal-evidence-mode=${requestedEvidenceHead ? "1" : "0"}`,
         `assertion:provider-discovery-responses=${providerDiscoveryResponses}`,
+        `assertion:wallet-chunk-requests=${walletChunkRequests}`,
         `assertion:wallet-chunk-responses=${walletChunkResponses}`,
         `assertion:wallet-methods=${walletMethods.join(",")}`,
         ...frontendEvents,
