@@ -7,13 +7,13 @@
 import { Capacitor } from "@capacitor/core";
 import type {
   EncryptedRemoteControlEnvelope,
-  isRemoteControllerPublicIdentity,
   RemoteCommandAction,
   RemoteControllerPublicIdentity,
   RemoteJsonValue,
   RemoteTargetPublicIdentity,
   SignedRemoteCommand,
 } from "@elizaos/shared/contracts/remote-control";
+import { isRemoteControllerPublicIdentity } from "@elizaos/shared/contracts/remote-control";
 import { invokeDesktopBridgeRequest } from "../bridge/electrobun-rpc";
 
 interface NativeRemoteControllerPlugin {
