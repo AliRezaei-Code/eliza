@@ -55,7 +55,7 @@ describe("Capacitor remote controller bridge", () => {
     );
   });
 
-  it("rejects native output containing private JWK material or wrong owner", async () => {
+  it("rejects native output containing private JWK material", async () => {
     native.getOrCreateIdentity.mockResolvedValue({
       version: 1,
       role: "controller",
@@ -74,6 +74,24 @@ describe("Capacitor remote controller bridge", () => {
       encryptionPublicKeyJwk: { kty: "EC", x: "x", y: "y", crv: "P-256" },
       createdAt: Date.now(),
       privateKeyJwk: { d: "secret" },
+    });
+    await expect(
+      getOrCreateRemoteControllerIdentity({ ownerId: "owner-1" }),
+    ).rejects.toThrow("Secure mobile pairing identity is unavailable");
+  });
+
+  it("rejects native output for the wrong owner or platform", async () => {
+    native.getOrCreateIdentity.mockResolvedValue({
+      version: 1,
+      role: "controller",
+      ownerId: "other-owner",
+      deviceId: "iphone-1",
+      keyId: "key-1",
+      displayName: "My iPhone",
+      platform: "android",
+      signingPublicKeyJwk: { kty: "EC", x: "x", y: "y", crv: "P-256" },
+      encryptionPublicKeyJwk: { kty: "EC", x: "x", y: "y", crv: "P-256" },
+      createdAt: Date.now(),
     });
     await expect(
       getOrCreateRemoteControllerIdentity({ ownerId: "owner-1" }),

@@ -77,6 +77,9 @@ export async function getOrCreateRemoteControllerIdentity(input: {
       displayName: input.displayName ?? "My iPhone",
       platform: Capacitor.getPlatform(),
     });
+    if (!isRemoteControllerPublicIdentity(identity)) {
+      throw new Error("Secure mobile pairing identity is unavailable.");
+    }
     const publicIdentity = identity && {
       version: identity.version,
       role: identity.role,
