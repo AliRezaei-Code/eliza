@@ -937,6 +937,13 @@ async function ensureUiDistReady(): Promise<void> {
     return;
   }
 
+  // Fast desktop builds intentionally use Vite emptyOutDir=false so ordinary
+  // local rebuilds can reuse unchanged chunks. Formal evidence cannot inherit
+  // that state: every served asset and every manifest entry must have been
+  // emitted by this exact clean-HEAD invocation.
+  if (evidenceHead) {
+    await removePathRecursive(APP_DIST_DIR);
+  }
   await removePathRecursive(path.join(APP_DIR, ".vite"));
 
   const logs: string[] = [];
