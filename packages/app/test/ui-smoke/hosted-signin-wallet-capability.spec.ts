@@ -322,37 +322,68 @@ function createInitialLoginDocumentGate(
   };
 }
 
-async function installProviderFixture(
+async function installEvidenceInitScript(
   context: BrowserContext,
-  page: Page,
-  expectedRendererOrigin: string,
 ): Promise<void> {
   // Keep the provider-backed intent pending after the lazy boundary. The test
   // proves capability rendering, not an account authorization, and must not
   // open a real wallet or paint a synthetic connection failure into evidence.
   await context.addInitScript(() => {
-    const methods: string[] = [];
-    Object.defineProperty(window, "__elizaWalletCapabilityMethods", {
-      configurable: true,
-      value: methods,
+    if (Reflect.get(globalThis, "__elizaEvidenceFixtureInstalled") === true) {
+      return;
+    }
+    let ethAccountsCount = 0;
+    let unexpectedMethodCount = 0;
+    Object.defineProperty(window, "__elizaWalletCapabilityMethodSummary", {
+      configurable: false,
+      get: () => ({ ethAccountsCount, unexpectedMethodCount }),
     });
-    const ethereum = {
-      request: ({ method }: { method: string }) => {
-        methods.push(method);
+    const ethereum: Record<string, unknown> = {};
+    Object.defineProperty(ethereum, "request", {
+      configurable: false,
+      enumerable: true,
+      value: ({ method }: { method: unknown }) => {
         if (method === "eth_accounts") {
+          ethAccountsCount += 1;
           return new Promise<readonly string[]>(() => {});
         }
-        return Promise.reject(new Error(`Unexpected wallet method: ${method}`));
+        unexpectedMethodCount += 1;
+        return Promise.reject(new Error("Unexpected wallet method"));
       },
-    };
-    Object.defineProperty(window, "ethereum", {
-      configurable: true,
-      value: ethereum,
+      writable: false,
     });
+    Object.defineProperty(window, "ethereum", {
+      configurable: false,
+      value: ethereum,
+      writable: false,
+    });
+    if (
+      !Reflect.defineProperty(globalThis, "__elizaEvidenceFixtureInstalled", {
+        configurable: false,
+        enumerable: false,
+        value: true,
+        writable: false,
+      })
+    ) {
+      throw new Error("Evidence fixture installation failed");
+    }
   });
+}
+
+type ProviderFixtureState = {
+  wasLoginDocumentWorkerCspApplied: () => boolean;
+};
+
+async function installProviderFixture(
+  context: BrowserContext,
+  page: Page,
+  expectedRendererOrigin: string,
+): Promise<ProviderFixtureState> {
+  await installEvidenceInitScript(context);
   // This catch-all is installed before navigation, so unexpected wallet RPC,
   // WalletConnect, OAuth, or provider traffic is aborted before network egress
   // instead of merely being noticed after transmission.
+  let loginDocumentWorkerCspApplied = false;
   const consumeInitialLoginDocument = createInitialLoginDocumentGate(
     expectedRendererOrigin,
   );
@@ -371,16 +402,39 @@ async function installProviderFixture(
       await route.abort("blockedbyclient");
       return;
     }
-    if (
-      request.resourceType() === "document" &&
-      !consumeInitialLoginDocument(
-        request.method(),
-        requestUrl,
-        request.resourceType(),
-        request.frame() === page.mainFrame(),
-      )
-    ) {
-      await route.abort("blockedbyclient");
+    if (request.resourceType() === "document") {
+      if (
+        !consumeInitialLoginDocument(
+          request.method(),
+          requestUrl,
+          request.resourceType(),
+          request.frame() === page.mainFrame(),
+        )
+      ) {
+        await route.abort("blockedbyclient");
+        return;
+      }
+      const upstreamResponse = await route.fetch({ maxRedirects: 0 });
+      const upstreamHeaders = upstreamResponse.headers();
+      if (
+        upstreamResponse.status() !== 200 ||
+        !/^text\/html(?:;|$)/i.test(upstreamHeaders["content-type"] ?? "")
+      ) {
+        await route.abort("blockedbyclient");
+        return;
+      }
+      const existingCsp = upstreamHeaders["content-security-policy"]?.trim();
+      const workerBlockingCsp = existingCsp
+        ? `${existingCsp}, worker-src 'none'`
+        : "worker-src 'none'";
+      loginDocumentWorkerCspApplied = true;
+      await route.fulfill({
+        response: upstreamResponse,
+        headers: {
+          ...upstreamHeaders,
+          "content-security-policy": workerBlockingCsp,
+        },
+      });
       return;
     }
     if (
@@ -412,6 +466,9 @@ async function installProviderFixture(
     }
     await route.fallback();
   });
+  return {
+    wasLoginDocumentWorkerCspApplied: () => loginDocumentWorkerCspApplied,
+  };
 }
 
 function parseUrl(rawUrl: string): URL | null {
@@ -496,6 +553,431 @@ function classifyConsoleMessage(type: string, rawText: string): string {
 function classifyRequestFailure(rawText: string | undefined): string {
   if (rawText && /^net::[A-Z0-9_]+$/i.test(rawText)) return rawText;
   return "[redacted-request-failure]";
+}
+
+type WalletMethodLabel = "eth_accounts" | "[unexpected-wallet-method]";
+
+type WalletMethodDiagnostics = {
+  ethAccountsObserved: boolean;
+  labels: WalletMethodLabel[];
+  summaryValid: boolean;
+  unexpectedMethodObserved: boolean;
+};
+
+async function readWalletMethodDiagnostics(
+  page: Page,
+): Promise<WalletMethodDiagnostics> {
+  const summary = await page.evaluate(() => {
+    const rawSummary = Reflect.get(
+      window,
+      "__elizaWalletCapabilityMethodSummary",
+    );
+    if (rawSummary === null || typeof rawSummary !== "object") {
+      return {
+        ethAccountsObserved: false,
+        summaryValid: false,
+        unexpectedMethodObserved: true,
+      };
+    }
+    const ethAccountsCount = Reflect.get(rawSummary, "ethAccountsCount");
+    const unexpectedMethodCount = Reflect.get(
+      rawSummary,
+      "unexpectedMethodCount",
+    );
+    const summaryValid =
+      Number.isSafeInteger(ethAccountsCount) &&
+      ethAccountsCount >= 0 &&
+      Number.isSafeInteger(unexpectedMethodCount) &&
+      unexpectedMethodCount >= 0;
+    return {
+      ethAccountsObserved: summaryValid && ethAccountsCount > 0,
+      summaryValid,
+      unexpectedMethodObserved: !summaryValid || unexpectedMethodCount > 0,
+    };
+  });
+
+  const labels: WalletMethodLabel[] = [];
+  if (summary.ethAccountsObserved) labels.push("eth_accounts");
+  if (summary.unexpectedMethodObserved) {
+    labels.push("[unexpected-wallet-method]");
+  }
+  return { ...summary, labels };
+}
+
+type WorkerCspNegativeControls = {
+  cspControlLocationExact: boolean;
+  frameDedicatedWorkerBlocked: boolean;
+  frameDedicatedWorkerNative: boolean;
+  frameSharedWorkerBlocked: boolean;
+  frameSharedWorkerNative: boolean;
+  mainDedicatedWorkerBlocked: boolean;
+  mainDedicatedWorkerNative: boolean;
+  mainSharedWorkerBlocked: boolean;
+  mainSharedWorkerNative: boolean;
+  positiveControlLocationExact: boolean;
+  positiveFrameDedicatedWorkerExecuted: boolean;
+  positiveFrameSharedWorkerExecuted: boolean;
+  positiveMainDedicatedWorkerExecuted: boolean;
+  positiveMainSharedWorkerExecuted: boolean;
+  unknownWalletMethodLabeledGenerically: boolean;
+  unknownWalletMethodRejected: boolean;
+};
+
+type WorkerRealmControls = {
+  frameDedicatedWorkerBlocked: boolean;
+  frameDedicatedWorkerExecuted: boolean;
+  frameDedicatedWorkerNative: boolean;
+  frameSharedWorkerBlocked: boolean;
+  frameSharedWorkerExecuted: boolean;
+  frameSharedWorkerNative: boolean;
+  mainDedicatedWorkerBlocked: boolean;
+  mainDedicatedWorkerExecuted: boolean;
+  mainDedicatedWorkerNative: boolean;
+  mainSharedWorkerBlocked: boolean;
+  mainSharedWorkerExecuted: boolean;
+  mainSharedWorkerNative: boolean;
+  unknownWalletMethodLabeledGenerically: boolean;
+  unknownWalletMethodRejected: boolean;
+};
+
+async function runWorkerRealmControls(
+  controlPage: Page,
+): Promise<WorkerRealmControls> {
+  return controlPage.evaluate(async () => {
+    type Realm = Window & typeof globalThis;
+    type WorkerOutcome = {
+      blocked: boolean;
+      executed: boolean;
+      nativeConstructor: boolean;
+    };
+
+    const isNativeConstructor = (
+      realm: Realm,
+      constructorName: "Worker" | "SharedWorker",
+    ): boolean => {
+      const candidate = Reflect.get(realm, constructorName);
+      return (
+        typeof candidate === "function" &&
+        Reflect.apply(
+          realm.Function.prototype.toString,
+          candidate,
+          [],
+        ).includes("[native code]")
+      );
+    };
+
+    const exerciseDedicatedWorker = async (
+      realm: Realm,
+    ): Promise<WorkerOutcome> => {
+      const workerConstructor = Reflect.get(realm, "Worker");
+      const nativeConstructor = isNativeConstructor(realm, "Worker");
+      if (typeof workerConstructor !== "function") {
+        return { blocked: false, executed: false, nativeConstructor };
+      }
+      const blobUrl = realm.URL.createObjectURL(
+        new realm.Blob(['postMessage("worker-code-executed")'], {
+          type: "text/javascript",
+        }),
+      );
+      let worker: Worker | null = null;
+      let timeoutId: number | null = null;
+      try {
+        const outcome = await new Promise<"blocked" | "executed" | "timeout">(
+          (resolve) => {
+            let settled = false;
+            const finish = (result: "blocked" | "executed" | "timeout") => {
+              if (settled) return;
+              settled = true;
+              resolve(result);
+            };
+            try {
+              worker = Reflect.construct(workerConstructor, [
+                blobUrl,
+              ]) as Worker;
+              worker.addEventListener("message", () => finish("executed"), {
+                once: true,
+              });
+              worker.addEventListener(
+                "error",
+                (event) => {
+                  event.preventDefault();
+                  finish("blocked");
+                },
+                { once: true },
+              );
+              timeoutId = realm.setTimeout(() => finish("timeout"), 1_000);
+            } catch {
+              finish("blocked");
+            }
+          },
+        );
+        return {
+          blocked: outcome === "blocked",
+          executed: outcome === "executed",
+          nativeConstructor,
+        };
+      } finally {
+        if (timeoutId !== null) realm.clearTimeout(timeoutId);
+        worker?.terminate();
+        realm.URL.revokeObjectURL(blobUrl);
+      }
+    };
+
+    const exerciseSharedWorker = async (
+      realm: Realm,
+      workerName: "worker-control-frame" | "worker-control-main",
+    ): Promise<WorkerOutcome> => {
+      const sharedWorkerConstructor = Reflect.get(realm, "SharedWorker");
+      const nativeConstructor = isNativeConstructor(realm, "SharedWorker");
+      if (typeof sharedWorkerConstructor !== "function") {
+        return { blocked: false, executed: false, nativeConstructor };
+      }
+      const blobUrl = realm.URL.createObjectURL(
+        new realm.Blob(
+          [
+            'onconnect = (event) => event.ports[0].postMessage("shared-worker-code-executed")',
+          ],
+          { type: "text/javascript" },
+        ),
+      );
+      let sharedWorker: SharedWorker | null = null;
+      let timeoutId: number | null = null;
+      try {
+        const outcome = await new Promise<"blocked" | "executed" | "timeout">(
+          (resolve) => {
+            let settled = false;
+            const finish = (result: "blocked" | "executed" | "timeout") => {
+              if (settled) return;
+              settled = true;
+              resolve(result);
+            };
+            try {
+              sharedWorker = Reflect.construct(sharedWorkerConstructor, [
+                blobUrl,
+                workerName,
+              ]) as SharedWorker;
+              sharedWorker.addEventListener(
+                "error",
+                (event) => {
+                  event.preventDefault();
+                  finish("blocked");
+                },
+                { once: true },
+              );
+              sharedWorker.port.addEventListener(
+                "message",
+                () => finish("executed"),
+                { once: true },
+              );
+              sharedWorker.port.start();
+              timeoutId = realm.setTimeout(() => finish("timeout"), 1_000);
+            } catch {
+              finish("blocked");
+            }
+          },
+        );
+        return {
+          blocked: outcome === "blocked",
+          executed: outcome === "executed",
+          nativeConstructor,
+        };
+      } finally {
+        if (timeoutId !== null) realm.clearTimeout(timeoutId);
+        sharedWorker?.port.close();
+        realm.URL.revokeObjectURL(blobUrl);
+      }
+    };
+
+    const mainRealm = window as Realm;
+    const mainDedicatedWorker = await exerciseDedicatedWorker(mainRealm);
+    const mainSharedWorker = await exerciseSharedWorker(
+      mainRealm,
+      "worker-control-main",
+    );
+
+    const iframe = document.createElement("iframe");
+    iframe.hidden = true;
+    iframe.srcdoc = "<!doctype html><html><body></body></html>";
+    const frameLoaded = new Promise<boolean>((resolve) => {
+      iframe.addEventListener("load", () => resolve(true), { once: true });
+      iframe.addEventListener("error", () => resolve(false), { once: true });
+    });
+    document.documentElement.append(iframe);
+
+    let frameDedicatedWorker: WorkerOutcome = {
+      blocked: false,
+      executed: false,
+      nativeConstructor: false,
+    };
+    let frameSharedWorker: WorkerOutcome = {
+      blocked: false,
+      executed: false,
+      nativeConstructor: false,
+    };
+    let unknownWalletMethodRejected = false;
+    let unknownWalletMethodLabeledGenerically = false;
+    try {
+      if (await frameLoaded) {
+        const frameWindow = iframe.contentWindow as Realm | null;
+        if (frameWindow) {
+          frameDedicatedWorker = await exerciseDedicatedWorker(frameWindow);
+          frameSharedWorker = await exerciseSharedWorker(
+            frameWindow,
+            "worker-control-frame",
+          );
+
+          const ethereum = Reflect.get(frameWindow, "ethereum");
+          const request =
+            ethereum && typeof ethereum === "object"
+              ? Reflect.get(ethereum, "request")
+              : null;
+          if (typeof request === "function") {
+            try {
+              await Reflect.apply(request, ethereum, [
+                { method: "__eliza_evidence_unknown_method__" },
+              ]);
+            } catch {
+              unknownWalletMethodRejected = true;
+            }
+          }
+          const rawSummary = Reflect.get(
+            frameWindow,
+            "__elizaWalletCapabilityMethodSummary",
+          );
+          unknownWalletMethodLabeledGenerically =
+            rawSummary !== null &&
+            typeof rawSummary === "object" &&
+            Reflect.get(rawSummary, "ethAccountsCount") === 0 &&
+            Reflect.get(rawSummary, "unexpectedMethodCount") === 1;
+        }
+      }
+    } finally {
+      iframe.remove();
+    }
+
+    return {
+      frameDedicatedWorkerBlocked: frameDedicatedWorker.blocked,
+      frameDedicatedWorkerExecuted: frameDedicatedWorker.executed,
+      frameDedicatedWorkerNative: frameDedicatedWorker.nativeConstructor,
+      frameSharedWorkerBlocked: frameSharedWorker.blocked,
+      frameSharedWorkerExecuted: frameSharedWorker.executed,
+      frameSharedWorkerNative: frameSharedWorker.nativeConstructor,
+      mainDedicatedWorkerBlocked: mainDedicatedWorker.blocked,
+      mainDedicatedWorkerExecuted: mainDedicatedWorker.executed,
+      mainDedicatedWorkerNative: mainDedicatedWorker.nativeConstructor,
+      mainSharedWorkerBlocked: mainSharedWorker.blocked,
+      mainSharedWorkerExecuted: mainSharedWorker.executed,
+      mainSharedWorkerNative: mainSharedWorker.nativeConstructor,
+      unknownWalletMethodLabeledGenerically,
+      unknownWalletMethodRejected,
+    };
+  });
+}
+
+async function runIsolatedWorkerCspNegativeControls(
+  productionContext: BrowserContext,
+): Promise<WorkerCspNegativeControls> {
+  const browser = productionContext.browser();
+  if (!browser) {
+    throw new Error("Worker CSP controls require a browser-backed context");
+  }
+  // A separate context prevents intentional CSP violations, console errors,
+  // and control-page resources from entering any production-page counter.
+  const controlContext = await browser.newContext({ serviceWorkers: "block" });
+  const cspControlUrl = "https://worker-csp-control.invalid/";
+  const positiveControlUrl = "https://worker-csp-positive.invalid/";
+  const controlHtml =
+    '<!doctype html><html><head><meta charset="utf-8"></head><body></body></html>';
+  try {
+    await installEvidenceInitScript(controlContext);
+    await controlContext.route("**/*", async (route) => {
+      const request = route.request();
+      const requestUrl = request.url();
+      if (
+        request.method() !== "GET" ||
+        request.resourceType() !== "document" ||
+        (requestUrl !== cspControlUrl && requestUrl !== positiveControlUrl)
+      ) {
+        await route.abort("blockedbyclient");
+        return;
+      }
+      await route.fulfill({
+        status: 200,
+        contentType: "text/html; charset=utf-8",
+        ...(requestUrl === cspControlUrl
+          ? {
+              headers: {
+                "content-security-policy": "worker-src 'none'",
+              },
+            }
+          : {}),
+        body: controlHtml,
+      });
+    });
+
+    const positivePage = await controlContext.newPage();
+    await positivePage.goto(positiveControlUrl, { waitUntil: "load" });
+    const positiveControlLocationExact = await positivePage.evaluate(
+      () =>
+        window.location.origin === "https://worker-csp-positive.invalid" &&
+        window.location.pathname === "/" &&
+        window.location.search === "" &&
+        window.location.hash === "",
+    );
+    const positiveControls = await runWorkerRealmControls(positivePage);
+    await positivePage.close();
+
+    const cspPage = await controlContext.newPage();
+    await cspPage.goto(cspControlUrl, { waitUntil: "load" });
+    const cspControlLocationExact = await cspPage.evaluate(
+      () =>
+        window.location.origin === "https://worker-csp-control.invalid" &&
+        window.location.pathname === "/" &&
+        window.location.search === "" &&
+        window.location.hash === "",
+    );
+    const cspControls = await runWorkerRealmControls(cspPage);
+
+    return {
+      cspControlLocationExact,
+      frameDedicatedWorkerBlocked: cspControls.frameDedicatedWorkerBlocked,
+      frameDedicatedWorkerNative: cspControls.frameDedicatedWorkerNative,
+      frameSharedWorkerBlocked: cspControls.frameSharedWorkerBlocked,
+      frameSharedWorkerNative: cspControls.frameSharedWorkerNative,
+      mainDedicatedWorkerBlocked: cspControls.mainDedicatedWorkerBlocked,
+      mainDedicatedWorkerNative: cspControls.mainDedicatedWorkerNative,
+      mainSharedWorkerBlocked: cspControls.mainSharedWorkerBlocked,
+      mainSharedWorkerNative: cspControls.mainSharedWorkerNative,
+      positiveControlLocationExact,
+      positiveFrameDedicatedWorkerExecuted:
+        positiveControls.frameDedicatedWorkerExecuted,
+      positiveFrameSharedWorkerExecuted:
+        positiveControls.frameSharedWorkerExecuted,
+      positiveMainDedicatedWorkerExecuted:
+        positiveControls.mainDedicatedWorkerExecuted,
+      positiveMainSharedWorkerExecuted:
+        positiveControls.mainSharedWorkerExecuted,
+      unknownWalletMethodLabeledGenerically:
+        cspControls.unknownWalletMethodLabeledGenerically,
+      unknownWalletMethodRejected: cspControls.unknownWalletMethodRejected,
+    };
+  } finally {
+    await controlContext.close();
+  }
+}
+
+async function isAtExactLoginLocation(
+  page: Page,
+  expectedRendererOrigin: string,
+): Promise<boolean> {
+  return page.evaluate(
+    ({ expectedOrigin }) =>
+      window.location.origin === expectedOrigin &&
+      window.location.pathname === "/login" &&
+      window.location.search === "" &&
+      window.location.hash === "",
+    { expectedOrigin: expectedRendererOrigin },
+  );
 }
 
 async function assertExactEvidenceRenderer(page: Page): Promise<boolean> {
@@ -786,6 +1268,10 @@ for (const viewport of VIEWPORTS) {
     let providerDiscoveryResponses = 0;
     let walletChunkRequests = 0;
     let walletChunkResponses = 0;
+    let pageErrorPhase:
+      | "[initial-render-page-error]"
+      | "[wallet-disclosure-page-error]"
+      | "[wallet-intent-page-error]" = "[initial-render-page-error]";
 
     const attachPageDiagnostics = (observedPage: Page) => {
       if (observedPage !== page) unexpectedPages.push("[additional-page]");
@@ -797,8 +1283,8 @@ for (const viewport of VIEWPORTS) {
         frontendEvents.push(classified);
         if (message.type() === "error") consoleErrors.push(classified);
       });
-      observedPage.on("pageerror", (error) => {
-        pageErrors.push(error.name || "Error");
+      observedPage.on("pageerror", () => {
+        pageErrors.push(pageErrorPhase);
       });
       observedPage.on("framenavigated", (frame) => {
         if (
@@ -813,7 +1299,6 @@ for (const viewport of VIEWPORTS) {
       });
     };
     attachPageDiagnostics(page);
-    context.on("page", attachPageDiagnostics);
     context.on("request", (request) => {
       const path = safeResourceLabel(request.url(), expectedRendererOrigin);
       const requestPath = resolveRequestPath(request.url());
@@ -936,15 +1421,100 @@ for (const viewport of VIEWPORTS) {
       unexpectedLocalWebSockets.push("WS:[local-resource]");
       await webSocket.close({ code: 1008, reason: "blocked by test policy" });
     });
-    await installProviderFixture(context, page, expectedRendererOrigin);
+    const providerFixtureState = await installProviderFixture(
+      context,
+      page,
+      expectedRendererOrigin,
+    );
+    const workerCspNegativeControls =
+      await runIsolatedWorkerCspNegativeControls(context);
+    context.on("page", attachPageDiagnostics);
+
+    expect(
+      workerCspNegativeControls.positiveControlLocationExact,
+      "the no-CSP control must use its exact fixed secure origin",
+    ).toBe(true);
+    expect(
+      workerCspNegativeControls.positiveMainDedicatedWorkerExecuted,
+      "the no-CSP main-frame Dedicated Worker control must execute",
+    ).toBe(true);
+    expect(
+      workerCspNegativeControls.positiveMainSharedWorkerExecuted,
+      "the no-CSP main-frame SharedWorker control must execute",
+    ).toBe(true);
+    expect(
+      workerCspNegativeControls.positiveFrameDedicatedWorkerExecuted,
+      "the no-CSP srcdoc Dedicated Worker control must execute",
+    ).toBe(true);
+    expect(
+      workerCspNegativeControls.positiveFrameSharedWorkerExecuted,
+      "the no-CSP srcdoc SharedWorker control must execute",
+    ).toBe(true);
+    expect(
+      workerCspNegativeControls.cspControlLocationExact,
+      "the CSP control must use its exact fixed secure origin",
+    ).toBe(true);
+    expect(
+      workerCspNegativeControls.mainDedicatedWorkerNative,
+      "the control page must retain its native Dedicated Worker constructor",
+    ).toBe(true);
+    expect(
+      workerCspNegativeControls.mainDedicatedWorkerBlocked,
+      "the control-page CSP must block Dedicated Worker code execution",
+    ).toBe(true);
+    expect(
+      workerCspNegativeControls.mainSharedWorkerNative,
+      "the control page must retain its native SharedWorker constructor",
+    ).toBe(true);
+    expect(
+      workerCspNegativeControls.mainSharedWorkerBlocked,
+      "the control-page CSP must block SharedWorker code execution",
+    ).toBe(true);
+    expect(
+      workerCspNegativeControls.frameDedicatedWorkerNative,
+      "the srcdoc frame must retain its native Dedicated Worker constructor",
+    ).toBe(true);
+    expect(
+      workerCspNegativeControls.frameDedicatedWorkerBlocked,
+      "the inherited CSP must block Dedicated Worker code in the srcdoc frame",
+    ).toBe(true);
+    expect(
+      workerCspNegativeControls.frameSharedWorkerNative,
+      "the srcdoc frame must retain its native SharedWorker constructor",
+    ).toBe(true);
+    expect(
+      workerCspNegativeControls.frameSharedWorkerBlocked,
+      "the inherited CSP must block SharedWorker code in the srcdoc frame",
+    ).toBe(true);
+    expect(
+      workerCspNegativeControls.unknownWalletMethodRejected,
+      "an unknown wallet method must reject inside the page",
+    ).toBe(true);
+    expect(
+      workerCspNegativeControls.unknownWalletMethodLabeledGenerically,
+      "an unknown wallet method must use only the generic diagnostic bucket",
+    ).toBe(true);
 
     await page.goto(expectedLoginUrl);
     await expect(page.getByRole("heading", { name: "Sign in" })).toBeVisible();
-    await expect(page).toHaveURL(expectedLoginUrl);
+    expect(
+      await isAtExactLoginLocation(page, expectedRendererOrigin),
+      "the rendered page must remain at the exact login location",
+    ).toBe(true);
+    expect(
+      providerFixtureState.wasLoginDocumentWorkerCspApplied(),
+      "the initial login response must carry the worker-blocking CSP",
+    ).toBe(true);
     const exactRendererCommitVerified = await assertExactEvidenceRenderer(page);
+    await page.waitForTimeout(50);
+    expect(
+      pageErrors.length,
+      "the initial renderer must be error-free before wallet disclosure",
+    ).toBe(0);
     expect(walletChunkRequests).toBe(0);
     expect(walletChunkResponses).toBe(0);
 
+    pageErrorPhase = "[wallet-disclosure-page-error]";
     const walletToggle = page.getByRole("button", {
       name: "Continue with a wallet",
     });
@@ -967,11 +1537,13 @@ for (const viewport of VIEWPORTS) {
       walletChunkResponses,
       "wallet chunks must remain lazy after disclosure alone",
     ).toBe(0);
+    const walletMethodsBeforeIntent = await readWalletMethodDiagnostics(page);
     expect(
-      await page.evaluate(() => {
-        const methods = Reflect.get(window, "__elizaWalletCapabilityMethods");
-        return Array.isArray(methods) ? methods : [];
-      }),
+      walletMethodsBeforeIntent.summaryValid,
+      "wallet diagnostics must expose a valid fixed-shape summary",
+    ).toBe(true);
+    expect(
+      walletMethodsBeforeIntent.labels,
       "wallet discovery must not run before explicit chain intent",
     ).toEqual([]);
 
@@ -987,6 +1559,7 @@ for (const viewport of VIEWPORTS) {
     // The first provider click crosses the lazy boundary. The deterministic
     // EIP-1193 fixture keeps account access pending, so no wallet is authorized
     // and the resulting frame remains clean capability evidence.
+    pageErrorPhase = "[wallet-intent-page-error]";
     await evmButton.click();
     await expect(
       page.getByRole("button", { name: /Wallet options/i }),
@@ -1001,20 +1574,24 @@ for (const viewport of VIEWPORTS) {
     expect(providerDiscoveryResponses).toBe(1);
     expect(walletChunkRequests).toBeGreaterThanOrEqual(2);
     expect(walletChunkResponses).toBeGreaterThanOrEqual(2);
-    const walletMethods = await page.evaluate(() => {
-      const methods = Reflect.get(window, "__elizaWalletCapabilityMethods");
-      return Array.isArray(methods)
-        ? methods.filter(
-            (method): method is string => typeof method === "string",
-          )
-        : [];
-    });
-    expect(walletMethods).toContain("eth_accounts");
+    const walletMethodDiagnostics = await readWalletMethodDiagnostics(page);
     expect(
-      walletMethods.filter((method) => method !== "eth_accounts"),
-      "the capability proof must not request accounts or signatures",
-    ).toEqual([]);
-    await expect(page).toHaveURL(expectedLoginUrl);
+      walletMethodDiagnostics.summaryValid,
+      "wallet diagnostics must retain a valid fixed-shape summary",
+    ).toBe(true);
+    expect(
+      walletMethodDiagnostics.ethAccountsObserved,
+      "the capability proof must observe the allowlisted account probe",
+    ).toBe(true);
+    expect(
+      walletMethodDiagnostics.unexpectedMethodObserved,
+      "the capability proof must reject every unknown wallet method",
+    ).toBe(false);
+    expect(walletMethodDiagnostics.labels).toEqual(["eth_accounts"]);
+    expect(
+      await isAtExactLoginLocation(page, expectedRendererOrigin),
+      "the capability proof must remain at the exact login location",
+    ).toBe(true);
 
     const expectCleanDiagnostics = () => {
       expect(
@@ -1126,12 +1703,29 @@ for (const viewport of VIEWPORTS) {
         "assertion:unexpected-document-requests=0",
         "assertion:unexpected-main-frame-navigations=0",
         "assertion:unexpected-pages=0",
+        `assertion:login-worker-csp=${providerFixtureState.wasLoginDocumentWorkerCspApplied() ? "1" : "0"}`,
+        `assertion:positive-control-location-exact=${workerCspNegativeControls.positiveControlLocationExact ? "1" : "0"}`,
+        `assertion:positive-main-dedicated-worker-executed=${workerCspNegativeControls.positiveMainDedicatedWorkerExecuted ? "1" : "0"}`,
+        `assertion:positive-main-shared-worker-executed=${workerCspNegativeControls.positiveMainSharedWorkerExecuted ? "1" : "0"}`,
+        `assertion:positive-frame-dedicated-worker-executed=${workerCspNegativeControls.positiveFrameDedicatedWorkerExecuted ? "1" : "0"}`,
+        `assertion:positive-frame-shared-worker-executed=${workerCspNegativeControls.positiveFrameSharedWorkerExecuted ? "1" : "0"}`,
+        `assertion:csp-control-location-exact=${workerCspNegativeControls.cspControlLocationExact ? "1" : "0"}`,
+        `assertion:main-native-dedicated-worker=${workerCspNegativeControls.mainDedicatedWorkerNative ? "1" : "0"}`,
+        `assertion:main-csp-blocked-dedicated-worker=${workerCspNegativeControls.mainDedicatedWorkerBlocked ? "1" : "0"}`,
+        `assertion:main-native-shared-worker=${workerCspNegativeControls.mainSharedWorkerNative ? "1" : "0"}`,
+        `assertion:main-csp-blocked-shared-worker=${workerCspNegativeControls.mainSharedWorkerBlocked ? "1" : "0"}`,
+        `assertion:frame-native-dedicated-worker=${workerCspNegativeControls.frameDedicatedWorkerNative ? "1" : "0"}`,
+        `assertion:frame-csp-blocked-dedicated-worker=${workerCspNegativeControls.frameDedicatedWorkerBlocked ? "1" : "0"}`,
+        `assertion:frame-native-shared-worker=${workerCspNegativeControls.frameSharedWorkerNative ? "1" : "0"}`,
+        `assertion:frame-csp-blocked-shared-worker=${workerCspNegativeControls.frameSharedWorkerBlocked ? "1" : "0"}`,
+        `assertion:unknown-wallet-method-rejected=${workerCspNegativeControls.unknownWalletMethodRejected ? "1" : "0"}`,
+        `assertion:unknown-wallet-method-generic-label=${workerCspNegativeControls.unknownWalletMethodLabeledGenerically ? "1" : "0"}`,
         `assertion:renderer-commit-match=${exactRendererCommitVerified ? "1" : "0"}`,
         `assertion:formal-evidence-mode=${requestedEvidenceHead ? "1" : "0"}`,
         `assertion:provider-discovery-responses=${providerDiscoveryResponses}`,
         `assertion:wallet-chunk-requests=${walletChunkRequests}`,
         `assertion:wallet-chunk-responses=${walletChunkResponses}`,
-        `assertion:wallet-methods=${walletMethods.join(",")}`,
+        `assertion:wallet-methods=${walletMethodDiagnostics.labels.join(",")}`,
         ...frontendEvents,
       ].join("\n")}\n`,
     );

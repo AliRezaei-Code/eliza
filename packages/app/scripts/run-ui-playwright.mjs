@@ -14,6 +14,12 @@ import {
   writeAuditProjectPropagation,
 } from "./lib/playwright-audit-projects.mjs";
 import {
+  assertFormalEvidenceRepositoryState,
+  resolveFormalEvidencePlaywrightConfig,
+  resolveLinkedRendererBuildPlan,
+  resolveUiSmokeReuseExistingServer,
+} from "./lib/playwright-formal-evidence.mjs";
+import {
   withElizaSourceNodeOptions,
   withoutElizaSourceNodeOptions,
 } from "./lib/playwright-node-options.mjs";
@@ -122,6 +128,20 @@ function resolveBunCommand() {
 }
 
 const env = { ...process.env };
+const selectedPlaywrightConfig = resolveFormalEvidencePlaywrightConfig(
+  env,
+  playwrightArgs,
+  appDir,
+);
+// Formal evidence must fail before this launcher cleans evidence output or
+// starts any build. The Playwright config repeats the check at its own process
+// boundary, after these builds and immediately before webServer startup.
+assertFormalEvidenceRepositoryState(env, repoRoot);
+resolveUiSmokeReuseExistingServer(env);
+const formalEvidenceValidated = Boolean(env.ELIZA_PR_EVIDENCE_HEAD?.trim());
+const linkedRendererBuildPlan = resolveLinkedRendererBuildPlan(repoRoot, {
+  formalEvidenceValidated,
+});
 // Derive the handoff from this invocation alone so a stale parent environment
 // can never opt the default E2E command into a dedicated audit project.
 writeAuditProjectPropagation(env, auditProjectsRequestedByArgs(playwrightArgs));
@@ -144,10 +164,22 @@ if (process.platform === "win32") {
   env.Path = env.PATH;
 }
 
+function configPathIdentity(configPath) {
+  const absolutePath = path.resolve(appDir, configPath);
+  try {
+    return fs.realpathSync.native(absolutePath);
+  } catch {
+    // Let Playwright report a missing config. Keeping its normalized requested
+    // path here still makes exact non-symlinked config arguments deterministic.
+    return absolutePath;
+  }
+}
+
 function hasPlaywrightConfig(configName) {
   return (
-    playwrightArgs.includes("--config") &&
-    playwrightArgs.some((value) => value.includes(configName))
+    selectedPlaywrightConfig !== null &&
+    configPathIdentity(selectedPlaywrightConfig) ===
+      configPathIdentity(configName)
   );
 }
 
@@ -433,15 +465,15 @@ if (
   hasPlaywrightConfig("playwright.ui-smoke.config.ts") &&
   env.ELIZA_UI_SMOKE_SKIP_CORE_BUILD !== "1"
 ) {
+  // Formal plans contain only the two fixed repository-owned linked-package
+  // outputs; ordinary plans contain no cleanup target.
+  for (const outputDir of linkedRendererBuildPlan.cleanupOutputDirs) {
+    removePathRecursive(outputDir, "formal linked renderer build output");
+  }
+
   const coreBuild = spawnSync(
     process.execPath,
-    [
-      path.join(repoRoot, "packages", "scripts", "run-turbo.mjs"),
-      "run",
-      "build",
-      "--filter=@elizaos/shared",
-      "--filter=@elizaos/core",
-    ],
+    linkedRendererBuildPlan.turboArgs,
     {
       cwd: repoRoot,
       env: {
