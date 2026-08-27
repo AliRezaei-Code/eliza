@@ -15,7 +15,19 @@ import {
 test("a generated declaration removed during a concurrent build is skipped", () => {
   assert.equal(
     isMaintainedSource(
-      new URL("../../core/src/vanished-runtime-composition.d.ts", import.meta.url)
+      new URL(
+        "../../core/src/vanished-runtime-composition.d.ts",
+        import.meta.url,
+      ).pathname,
+    ),
+    false,
+  );
+});
+
+test("generated Vite dependency caches never enter the maintained inventory", () => {
+  assert.equal(
+    isMaintainedSource(
+      new URL("../../app/.vite/deps/@react-three_fiber.js", import.meta.url)
         .pathname,
     ),
     false,
