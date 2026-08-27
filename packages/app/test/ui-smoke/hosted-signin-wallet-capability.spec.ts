@@ -13,6 +13,7 @@ import {
   type TestInfo,
   test,
 } from "@playwright/test";
+import { assertFormalEvidencePreparationReceipt } from "../../scripts/lib/playwright-formal-evidence.mjs";
 import { saveBrowserVideoArtifact } from "./helpers/video-artifacts";
 
 test.use({
@@ -22,6 +23,7 @@ test.use({
 });
 
 const REPO_ROOT = path.resolve(import.meta.dirname, "../../../..");
+assertFormalEvidencePreparationReceipt(process.env, REPO_ROOT);
 
 function gitOutput(args: readonly string[]): string {
   return execFileSync("git", args, {
@@ -984,19 +986,30 @@ async function assertExactEvidenceRenderer(page: Page): Promise<boolean> {
   await expect
     .poll(
       () =>
-        page.evaluate(() => {
-          const stamp = Reflect.get(window, "__ELIZA_RENDERER_BUILD__");
-          if (stamp === null || typeof stamp !== "object") return null;
-          const commit = Reflect.get(stamp, "commit");
-          return typeof commit === "string" ? commit : null;
-        }),
+        page.evaluate(
+          ({ expectedCommit }) => {
+            try {
+              const stamp = Reflect.get(window, "__ELIZA_RENDERER_BUILD__");
+              if (stamp === null || typeof stamp !== "object") return false;
+              const commit = Reflect.get(stamp, "commit");
+              return (
+                typeof commit === "string" &&
+                /^[a-f0-9]{40}$/.test(commit) &&
+                commit === expectedCommit
+              );
+            } catch {
+              return false;
+            }
+          },
+          { expectedCommit: repositoryHead },
+        ),
       {
         message:
           "the rendered bundle must be stamped with checked-out repository HEAD",
         timeout: 15_000,
       },
     )
-    .toBe(repositoryHead);
+    .toBe(true);
   return true;
 }
 

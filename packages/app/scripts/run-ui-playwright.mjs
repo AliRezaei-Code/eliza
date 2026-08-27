@@ -15,6 +15,11 @@ import {
 } from "./lib/playwright-audit-projects.mjs";
 import {
   assertFormalEvidenceRepositoryState,
+  cleanupAbandonedFormalEvidencePreparationReceipts,
+  createFormalEvidencePreparationReceipt,
+  FORMAL_EVIDENCE_PREPARATION_ERROR,
+  FORMAL_EVIDENCE_PREPARATION_NONCE_ENV,
+  FORMAL_EVIDENCE_PREPARATION_RECEIPT_ENV,
   resolveFormalEvidencePlaywrightConfig,
   resolveLinkedRendererBuildPlan,
   resolveUiSmokeReuseExistingServer,
@@ -128,6 +133,10 @@ function resolveBunCommand() {
 }
 
 const env = { ...process.env };
+// Never accept a receipt inherited from a caller or an earlier invocation.
+delete env[FORMAL_EVIDENCE_PREPARATION_RECEIPT_ENV];
+delete env[FORMAL_EVIDENCE_PREPARATION_NONCE_ENV];
+cleanupAbandonedFormalEvidencePreparationReceipts();
 const selectedPlaywrightConfig = resolveFormalEvidencePlaywrightConfig(
   env,
   playwrightArgs,
@@ -139,6 +148,7 @@ const selectedPlaywrightConfig = resolveFormalEvidencePlaywrightConfig(
 assertFormalEvidenceRepositoryState(env, repoRoot);
 resolveUiSmokeReuseExistingServer(env);
 const formalEvidenceValidated = Boolean(env.ELIZA_PR_EVIDENCE_HEAD?.trim());
+let formalEvidencePreparationStartedAtMs = null;
 const linkedRendererBuildPlan = resolveLinkedRendererBuildPlan(repoRoot, {
   formalEvidenceValidated,
 });
@@ -308,12 +318,29 @@ function acquireUiSmokeViewLock() {
 }
 
 let releaseUiSmokeViewLock = null;
+let formalEvidencePreparationReceiptDir = null;
 
 function releaseLocks() {
+  let firstError = null;
   if (releaseUiSmokeViewLock) {
-    releaseUiSmokeViewLock();
+    const releaseViewLock = releaseUiSmokeViewLock;
     releaseUiSmokeViewLock = null;
+    try {
+      releaseViewLock();
+    } catch (error) {
+      firstError = error;
+    }
   }
+  if (formalEvidencePreparationReceiptDir) {
+    const receiptDir = formalEvidencePreparationReceiptDir;
+    formalEvidencePreparationReceiptDir = null;
+    try {
+      removePathRecursive(receiptDir, "formal evidence preparation receipt");
+    } catch (error) {
+      firstError ??= error;
+    }
+  }
+  if (firstError) throw firstError;
 }
 
 process.once("exit", releaseLocks);
@@ -381,6 +408,9 @@ if (runsAppAudit) {
   // intentionally skip rebuilding views. No concurrent audit can erase this
   // run's evidence after it starts writing.
   releaseUiSmokeViewLock = acquireUiSmokeViewLock();
+  if (formalEvidenceValidated) {
+    formalEvidencePreparationStartedAtMs = Date.now();
+  }
   cleanAuditAppOutput();
 }
 
@@ -420,6 +450,7 @@ if (hasPlaywrightConfig("playwright.ui-smoke.config.ts")) {
 // server must reject missing dist output instead of exercising the generic
 // placeholder used by lightweight offline smoke lanes. build-views runs below
 // before the server starts, making this a fail-closed provenance contract.
+let formalEvidenceViewBuildCompleted = false;
 if (
   hasPlaywrightConfig("playwright.ui-smoke.config.ts") &&
   hasPlaywrightProject("audit-app")
@@ -432,6 +463,14 @@ if (
   env.ELIZA_UI_SMOKE_SKIP_VIEW_BUILD !== "1"
 ) {
   releaseUiSmokeViewLock ??= acquireUiSmokeViewLock();
+  if (
+    formalEvidenceValidated &&
+    formalEvidencePreparationStartedAtMs === null
+  ) {
+    // Start covered-output freshness only after this invocation owns the view
+    // lock. Waiting for another healthy run must not age this preparation.
+    formalEvidencePreparationStartedAtMs = Date.now();
+  }
   const result = spawnSync(
     process.execPath,
     [path.join(repoRoot, "packages", "scripts", "build-views.mjs")],
@@ -449,6 +488,7 @@ if (
     releaseLocks();
     process.exit(status);
   }
+  formalEvidenceViewBuildCompleted = formalEvidenceValidated;
 }
 
 // The ui-smoke web server builds the renderer (`packages/app build:web`) whenever
@@ -461,6 +501,7 @@ if (
 // smoke spec runs. Build them first — gated only on the ui-smoke config (NOT on
 // live mode), mirroring the view-build step above. Turbo-cached → a fast no-op
 // when already up to date; skip with ELIZA_UI_SMOKE_SKIP_CORE_BUILD=1.
+let formalEvidenceLinkedBuildCompleted = false;
 if (
   hasPlaywrightConfig("playwright.ui-smoke.config.ts") &&
   env.ELIZA_UI_SMOKE_SKIP_CORE_BUILD !== "1"
@@ -487,6 +528,26 @@ if (
     releaseLocks();
     process.exit(coreBuild.status ?? 1);
   }
+  formalEvidenceLinkedBuildCompleted = formalEvidenceValidated;
+}
+
+if (formalEvidenceValidated) {
+  if (
+    !formalEvidenceViewBuildCompleted ||
+    !formalEvidenceLinkedBuildCompleted ||
+    formalEvidencePreparationStartedAtMs === null
+  ) {
+    throw new Error(FORMAL_EVIDENCE_PREPARATION_ERROR);
+  }
+  const receipt = createFormalEvidencePreparationReceipt(env, repoRoot, {
+    startedAtMs: formalEvidencePreparationStartedAtMs,
+  });
+  if (!receipt) {
+    throw new Error(FORMAL_EVIDENCE_PREPARATION_ERROR);
+  }
+  formalEvidencePreparationReceiptDir = receipt.receiptDirectory;
+  env[FORMAL_EVIDENCE_PREPARATION_RECEIPT_ENV] = receipt.receiptPath;
+  env[FORMAL_EVIDENCE_PREPARATION_NONCE_ENV] = receipt.nonce;
 }
 
 if (hasPlaywrightConfig("playwright.dev-smoke.config.ts")) {

@@ -38,6 +38,15 @@ then cleans and force-rebuilds the linked `@elizaos/shared` and
 `@elizaos/core` outputs before recording evidence. Regenerate the artifacts
 whenever `HEAD` changes.
 
+Use the package script above rather than invoking `bunx playwright` directly.
+In formal mode, the wrapper seals the freshly rebuilt view/shared/core outputs
+in an invocation-bound receipt, including every regular file in the linked
+shared/core `dist` trees and every discovered view bundle. The Playwright
+config validates that receipt before creating its web server, so a direct
+`--config` entry or stale ignored build output fails closed. The handoff is
+accepted only while its wrapper PID is live and for at most 24 hours after the
+build; a later runner removes dead, expired, or stale-incomplete receipts.
+
 This gate proves consistency between the caller-supplied SHA, local clean
 checkout, and rendered manifest. It does not resolve or attest a GitHub PR ref
 or trusted remote origin; verify the intended PR head independently before
