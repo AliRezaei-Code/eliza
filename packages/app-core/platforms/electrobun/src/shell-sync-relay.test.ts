@@ -269,7 +269,7 @@ describe("ShellControllerAuthority data paths", () => {
     other.release();
   });
 
-  it("truncates error messages with surrogate safety", async () => {
+  it("preserves complete owner-command errors", async () => {
     const authority = new ShellControllerAuthority();
     const owner = authority.register("main", vi.fn());
     const follower = authority.register("tray", vi.fn());
@@ -280,7 +280,8 @@ describe("ShellControllerAuthority data paths", () => {
       protocolVersion: SHELL_SYNC_PROTOCOL_VERSION,
     });
 
-    const longError = `${"a".repeat(1999)}😀${"b".repeat(10)}`;
+    const distinguishingTail = "owner-command-error-tail";
+    const longError = `${"a".repeat(2_100)}😀${distinguishingTail}`;
     const outcomePromise = follower.dispatchCommand({
       commandId: "cmd-err-1",
       command: {
@@ -305,9 +306,7 @@ describe("ShellControllerAuthority data paths", () => {
 
     const res = await outcomePromise;
     expect(res.ok).toBe(false);
-    expect(typeof res.error).toBe("string");
-    expect(res.error?.length).toBeLessThanOrEqual(2000);
-    expect(res.error?.endsWith("😀")).toBe(false);
-    expect(res.error?.endsWith("a")).toBe(true);
+    expect(res.error).toBe(longError);
+    expect(res.error).toContain(distinguishingTail);
   });
 });
