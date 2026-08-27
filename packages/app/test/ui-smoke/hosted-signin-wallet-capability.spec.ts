@@ -79,15 +79,58 @@ function isCanonicalProviderDiscovery(
 }
 
 function isAuthSurface(pathname: string): boolean {
+  if (pathname.startsWith("/assets/")) return false;
+
+  const hasAuthRouteSegment = pathname
+    .split("/")
+    .filter(Boolean)
+    .some((segment) =>
+      /^(?:(?:[a-z0-9]+[-_])*(?:auth|oauth2?|oidc|callback)(?:[-_][a-z0-9]+)*|authorize|authorization|authentication)$/i.test(
+        segment,
+      ),
+    );
+
   return (
-    /\/auth(?:\/|$)/i.test(pathname) ||
-    /^\/api\/cloud\/login(?:\/|$)/i.test(pathname)
+    hasAuthRouteSegment ||
+    /^\/api(?:\/[^/]+)*\/login(?:\/|$)/i.test(pathname) ||
+    /^\/(?:api\/)?\.well-known\/openid-configuration\/?$/i.test(pathname) ||
+    /^\/api(?:\/[^/]+)*\/(?:set-)?anonymous-session(?:\/|$)/i.test(pathname)
   );
 }
 
 function isForbiddenHttpAuthRequest(method: string, pathname: string): boolean {
   return (
     isAuthSurface(pathname) && !isCanonicalProviderDiscovery(method, pathname)
+  );
+}
+
+function isForbiddenLocalServiceRequest(
+  method: string,
+  pathname: string,
+): boolean {
+  return (
+    /^\/(?:api|steward)(?:\/|$)/i.test(pathname) &&
+    !isCanonicalProviderDiscovery(method, pathname)
+  );
+}
+
+function isBrowserDataRequest(resourceType: string): boolean {
+  return resourceType === "fetch" || resourceType === "xhr";
+}
+
+function isRendererManifestRequest(method: string, pathname: string): boolean {
+  return method === "GET" && pathname === "/eliza-renderer-build.json";
+}
+
+function isForbiddenLocalDataRequest(
+  method: string,
+  pathname: string,
+  resourceType: string,
+): boolean {
+  return (
+    isBrowserDataRequest(resourceType) &&
+    !isCanonicalProviderDiscovery(method, pathname) &&
+    !isRendererManifestRequest(method, pathname)
   );
 }
 
@@ -119,13 +162,14 @@ async function installProviderFixture(context: BrowserContext): Promise<void> {
   // WalletConnect, OAuth, or provider traffic is aborted before network egress
   // instead of merely being noticed after transmission.
   await context.route("**/*", async (route) => {
-    const requestUrl = route.request().url();
+    const request = route.request();
+    const requestUrl = request.url();
     const pathname = parseUrl(requestUrl)?.pathname ?? "";
     if (!isLoopbackOrLocalResource(requestUrl)) {
       await route.abort("blockedbyclient");
       return;
     }
-    if (isCanonicalProviderDiscovery(route.request().method(), pathname)) {
+    if (isCanonicalProviderDiscovery(request.method(), pathname)) {
       await route.fulfill({
         status: 200,
         contentType: "application/json",
@@ -133,7 +177,15 @@ async function installProviderFixture(context: BrowserContext): Promise<void> {
       });
       return;
     }
-    if (isForbiddenHttpAuthRequest(route.request().method(), pathname)) {
+    if (
+      isForbiddenHttpAuthRequest(request.method(), pathname) ||
+      isForbiddenLocalServiceRequest(request.method(), pathname) ||
+      isForbiddenLocalDataRequest(
+        request.method(),
+        pathname,
+        request.resourceType(),
+      )
+    ) {
       await route.abort("blockedbyclient");
       return;
     }
@@ -227,6 +279,84 @@ async function assertExactEvidenceRenderer(page: Page): Promise<boolean> {
   return true;
 }
 
+test("hosted login egress policy covers every current auth route family", () => {
+  const authCases = [
+    ["POST", "/steward/auth/providers"],
+    ["GET", "/app-auth/authorize"],
+    ["POST", "/api/v1/app-auth/connect"],
+    ["GET", "/api/v1/app-auth/mobile/config"],
+    ["POST", "/api/v1/cli-auth/start"],
+    ["GET", "/api/eliza-app/cli-auth/status"],
+    ["POST", "/api/v1/oauth/google/initiate"],
+    ["POST", "/api/cloud/v1/oauth/x/initiate"],
+    ["POST", "/api/v1/oauth-intents"],
+    ["GET", "/oidc/continue"],
+    ["GET", "/api/oidc/authorize"],
+    ["POST", "/api/oidc/token"],
+    ["GET", "/.well-known/openid-configuration"],
+    ["GET", "/api/.well-known/openid-configuration"],
+    ["GET", "/api/discord/oauth"],
+    ["GET", "/api/v1/discord/callback"],
+    ["GET", "/api/v1/twitter/callback"],
+    ["POST", "/api/discord-local/authorize"],
+    ["POST", "/api/accounts/openai-codex/oauth/start"],
+    ["GET", "/api/connectors/google/oauth/callback"],
+    ["POST", "/api/v1/eliza/paypal/authorize"],
+    ["GET", "/api/v1/eliza/paypal/popup-callback"],
+    ["POST", "/api/set-anonymous-session"],
+    ["GET", "/api/anonymous-session"],
+    ["POST", "/api/cloud/login"],
+    ["GET", "/api/cloud/login/status"],
+    ["POST", "/api/cloud/login/persist"],
+  ] as const;
+
+  for (const [method, pathname] of authCases) {
+    expect(
+      isForbiddenHttpAuthRequest(method, pathname),
+      `${method} ${pathname} must be classified as auth egress`,
+    ).toBe(true);
+  }
+
+  expect(isForbiddenHttpAuthRequest("GET", "/steward/auth/providers")).toBe(
+    false,
+  );
+  expect(isForbiddenHttpAuthRequest("GET", "/login")).toBe(false);
+  expect(
+    isForbiddenHttpAuthRequest("GET", "/assets/auth-provider-example.js"),
+  ).toBe(false);
+
+  for (const [method, pathname] of [
+    ["GET", "/api/health"],
+    ["POST", "/api/cloud/v1/twitter/connect"],
+    ["GET", "/steward/session"],
+  ] as const) {
+    expect(
+      isForbiddenLocalServiceRequest(method, pathname),
+      `${method} ${pathname} must be blocked by the local service allowlist`,
+    ).toBe(true);
+  }
+  expect(isForbiddenLocalServiceRequest("GET", "/steward/auth/providers")).toBe(
+    false,
+  );
+
+  expect(
+    isForbiddenLocalDataRequest("GET", "/eliza-renderer-build.json", "fetch"),
+  ).toBe(false);
+  expect(
+    isForbiddenLocalDataRequest("GET", "/steward/auth/providers", "fetch"),
+  ).toBe(false);
+  expect(
+    isForbiddenLocalDataRequest(
+      "POST",
+      "/api/cloud/v1/twitter/connect",
+      "fetch",
+    ),
+  ).toBe(true);
+  expect(isForbiddenLocalDataRequest("GET", "/assets/app.js", "script")).toBe(
+    false,
+  );
+});
+
 for (const viewport of VIEWPORTS) {
   test(`lazy wallet stack preserves SIWE-only discovery at ${viewport.name}`, async ({
     page,
@@ -240,6 +370,9 @@ for (const viewport of VIEWPORTS) {
     const nonLoopbackRequests: string[] = [];
     const nonLoopbackWebSockets: string[] = [];
     const forbiddenAuthWebSockets: string[] = [];
+    const unexpectedLocalWebSockets: string[] = [];
+    const unexpectedLocalServiceRequests: string[] = [];
+    const unexpectedLocalDataRequests: string[] = [];
     const unexpectedPages: string[] = [];
     const forbiddenAuthRequests: string[] = [];
     const consoleErrors: string[] = [];
@@ -272,6 +405,20 @@ for (const viewport of VIEWPORTS) {
       }
       if (isForbiddenHttpAuthRequest(request.method(), pathname)) {
         forbiddenAuthRequests.push(`${request.method()}:${path}`);
+      }
+      if (
+        isLoopbackOrLocalResource(request.url()) &&
+        isForbiddenLocalServiceRequest(request.method(), pathname)
+      ) {
+        unexpectedLocalServiceRequests.push(`${request.method()}:${path}`);
+      }
+      if (
+        isLoopbackOrLocalResource(request.url()) &&
+        isBrowserDataRequest(request.resourceType()) &&
+        !isCanonicalProviderDiscovery(request.method(), pathname) &&
+        !isRendererManifestRequest(request.method(), pathname)
+      ) {
+        unexpectedLocalDataRequests.push(`${request.method()}:${path}`);
       }
       if (
         pathname.includes("/assets/wallet-buttons-") ||
@@ -317,10 +464,9 @@ for (const viewport of VIEWPORTS) {
       }
       if (isAuthSurface(pathname)) {
         forbiddenAuthWebSockets.push(`WS:${safeResourceLabel(webSocketUrl)}`);
-        await webSocket.close({ code: 1008, reason: "blocked by test policy" });
-        return;
       }
-      webSocket.connectToServer();
+      unexpectedLocalWebSockets.push("WS:[local-resource]");
+      await webSocket.close({ code: 1008, reason: "blocked by test policy" });
     });
     await installProviderFixture(context);
 
@@ -430,6 +576,18 @@ for (const viewport of VIEWPORTS) {
         "the capability proof must not open an auth WebSocket",
       ).toEqual([]);
       expect(
+        unexpectedLocalWebSockets,
+        "the capability proof must not open any local WebSocket",
+      ).toEqual([]);
+      expect(
+        unexpectedLocalDataRequests,
+        "the capability proof must not make unallowlisted local data requests",
+      ).toEqual([]);
+      expect(
+        unexpectedLocalServiceRequests,
+        "the capability proof must not reach an unallowlisted local service endpoint",
+      ).toEqual([]);
+      expect(
         forbiddenAuthRequests,
         "the capability proof must not start OAuth or wallet auth",
       ).toEqual([]);
@@ -469,6 +627,9 @@ for (const viewport of VIEWPORTS) {
         "assertion:non-loopback-websockets=0",
         "assertion:forbidden-auth-requests=0",
         "assertion:forbidden-auth-websockets=0",
+        "assertion:unexpected-local-websockets=0",
+        "assertion:unexpected-local-service-requests=0",
+        "assertion:unexpected-local-data-requests=0",
         "assertion:unexpected-pages=0",
         `assertion:renderer-commit-match=${exactRendererCommitVerified ? "1" : "0"}`,
         `assertion:formal-evidence-mode=${requestedEvidenceHead ? "1" : "0"}`,
